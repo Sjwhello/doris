@@ -78,22 +78,15 @@ if [[ "${HELP}" -eq 1 ]]; then
     usage
 fi
 
+TPCH_QUERIES_DIR="${CURDIR}/../queries"
 if [[ ${SCALE_FACTOR} -eq 1 ]]; then
     echo "Running tpch sf 1 queries"
-    TPCH_QUERIES_DIR="${CURDIR}/../queries/sf1"
-    TPCH_OPT_CONF="${CURDIR}/../conf/opt/opt_sf1.sql"
 elif [[ ${SCALE_FACTOR} -eq 100 ]]; then
     echo "Running tpch sf 100 queries"
-    TPCH_QUERIES_DIR="${CURDIR}/../queries/sf100"
-    TPCH_OPT_CONF="${CURDIR}/../conf/opt/opt_sf100.sql"
 elif [[ ${SCALE_FACTOR} -eq 1000 ]]; then
     echo "Running tpch sf 1000 queries"
-    TPCH_QUERIES_DIR="${CURDIR}/../queries/sf1000"
-    TPCH_OPT_CONF="${CURDIR}/../conf/opt/opt_sf1000.sql"
 elif [[ ${SCALE_FACTOR} -eq 10000 ]]; then
     echo "Running tpch sf 10000 queries"
-    TPCH_QUERIES_DIR="${CURDIR}/../queries/sf10000"
-    TPCH_OPT_CONF="${CURDIR}/../conf/opt/opt_sf10000.sql"
 else
     echo "${SCALE_FACTOR} scale is NOT support currently."
     exit 1
@@ -123,26 +116,7 @@ run_sql() {
     echo "$*"
     mysql -h"${FE_HOST}" -u"${USER}" -P"${FE_QUERY_PORT}" -D"${DB}" -e "$*"
 }
-get_session_variable() {
-    k="$1"
-    v=$(mysql -h"${FE_HOST}" -u"${USER}" -P"${FE_QUERY_PORT}" -D"${DB}" -e"show variables like '${k}'\G" | grep " Value: ")
-    echo "${v/*Value: /}"
-}
-backup_session_variables_file="${CURDIR}/../conf/opt/backup_session_variables.sql"
-backup_session_variables() {
-    touch "${backup_session_variables_file}"
-    while IFS= read -r line; do
-        k="${line/set global /}"
-        k="${k%=*}"
-        v=$(get_session_variable "${k}")
-        echo "set global ${k}=${v};" >>"${backup_session_variables_file}"
-    done < <(grep -v '^ *#' <"${TPCH_OPT_CONF}")
-}
-backup_session_variables
 
-echo '============================================'
-echo "Optimize session variables"
-run_sql "source ${TPCH_OPT_CONF};"
 echo '============================================'
 run_sql "show variables;"
 echo '============================================'
@@ -200,7 +174,3 @@ echo "Total cold run time: ${cold_run_sum} ms"
 # tpch 流水线依赖这个'Total hot run time'字符串
 echo "Total hot run time: ${best_hot_run_sum} ms"
 echo 'Finish tpch queries.'
-
-echo "Restore session variables"
-run_sql "source ${backup_session_variables_file};"
-rm -f "${backup_session_variables_file}"

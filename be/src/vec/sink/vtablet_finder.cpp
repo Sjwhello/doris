@@ -32,6 +32,7 @@
 #include "vec/core/block.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 Status OlapTabletFinder::find_tablets(RuntimeState* state, Block* block, int rows,
                                       std::vector<VOlapTablePartition*>& partitions,
                                       std::vector<uint32_t>& tablet_index, bool& stop_processing,
@@ -62,7 +63,7 @@ Status OlapTabletFinder::find_tablets(RuntimeState* state, Block* block, int row
             _num_filtered_rows++;
             _filter_bitmap.Set(row_index, true);
             if (stop_processing) {
-                return Status::EndOfFile("Encountered unqualified data, stop processing");
+                return Status::DataQualityError("Encountered unqualified data, stop processing");
             }
             skip[row_index] = true;
             continue;

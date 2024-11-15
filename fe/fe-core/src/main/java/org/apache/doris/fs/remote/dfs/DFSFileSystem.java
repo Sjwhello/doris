@@ -21,22 +21,24 @@ import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.backup.Status;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.security.authentication.AuthenticationConfig;
-import org.apache.doris.common.security.authentication.HadoopUGI;
+import org.apache.doris.common.security.authentication.HadoopAuthenticator;
 import org.apache.doris.common.util.URI;
 import org.apache.doris.fs.operations.HDFSFileOperations;
 import org.apache.doris.fs.operations.HDFSOpParams;
 import org.apache.doris.fs.operations.OpParams;
+import org.apache.doris.fs.remote.RemoteFSPhantomManager;
 import org.apache.doris.fs.remote.RemoteFile;
 import org.apache.doris.fs.remote.RemoteFileSystem;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -54,15 +56,13 @@ import java.nio.file.Paths;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 public class DFSFileSystem extends RemoteFileSystem {
 
+    public static final String PROP_ALLOW_FALLBACK_TO_SIMPLE_AUTH = "ipc.client.fallback-to-simple-auth-allowed";
     private static final Logger LOG = LogManager.getLogger(DFSFileSystem.class);
-
     private HDFSFileOperations operations = null;
+    private HadoopAuthenticator authenticator = null;
 
     public DFSFileSystem(Map<String, String> properties) {
         this(StorageBackend.StorageType.HDFS, properties);
@@ -76,26 +76,56 @@ public class DFSFileSystem extends RemoteFileSystem {
     @VisibleForTesting
     @Override
     public FileSystem nativeFileSystem(String remotePath) throws UserException {
-        if (dfsFileSystem != null) {
-            return dfsFileSystem;
+        if (closed.get()) {
+            throw new UserException("FileSystem is closed.");
         }
-
-        Configuration conf = new HdfsConfiguration();
-        for (Map.Entry<String, String> propEntry : properties.entrySet()) {
-            conf.set(propEntry.getKey(), propEntry.getValue());
-        }
-
-        dfsFileSystem = HadoopUGI.ugiDoAs(AuthenticationConfig.getKerberosConfig(conf), () -> {
-            try {
-                return FileSystem.get(new Path(remotePath).toUri(), conf);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+        if (dfsFileSystem == null) {
+            synchronized (this) {
+                if (closed.get()) {
+                    throw new UserException("FileSystem is closed.");
+                }
+                if (dfsFileSystem == null) {
+                    Configuration conf = getHdfsConf(ifNotSetFallbackToSimpleAuth());
+                    for (Map.Entry<String, String> propEntry : properties.entrySet()) {
+                        conf.set(propEntry.getKey(), propEntry.getValue());
+                    }
+                    AuthenticationConfig authConfig = AuthenticationConfig.getKerberosConfig(conf);
+                    authenticator = HadoopAuthenticator.getHadoopAuthenticator(authConfig);
+                    try {
+                        dfsFileSystem = authenticator.doAs(() -> {
+                            try {
+                                return FileSystem.get(new Path(remotePath).toUri(), conf);
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+                        operations = new HDFSFileOperations(dfsFileSystem);
+                        RemoteFSPhantomManager.registerPhantomReference(this);
+                    } catch (Exception e) {
+                        throw new UserException("Failed to get dfs FileSystem for " + e.getMessage(), e);
+                    }
+                }
             }
-        });
-
-        Preconditions.checkNotNull(dfsFileSystem);
-        operations = new HDFSFileOperations(dfsFileSystem);
+        }
         return dfsFileSystem;
+    }
+
+    protected RemoteIterator<LocatedFileStatus> getLocatedFiles(boolean recursive,
+                FileSystem fileSystem, Path locatedPath) throws IOException {
+        return authenticator.doAs(() -> fileSystem.listFiles(locatedPath, recursive));
+    }
+
+    protected FileStatus[] getFileStatuses(String remotePath, FileSystem fileSystem) throws IOException {
+        return authenticator.doAs(() -> fileSystem.listStatus(new Path(remotePath)));
+    }
+
+    public static Configuration getHdfsConf(boolean fallbackToSimpleAuth) {
+        Configuration hdfsConf = new HdfsConfiguration();
+        if (fallbackToSimpleAuth) {
+            // need support fallback to simple if the cluster is a mixture of  kerberos and simple auth.
+            hdfsConf.set(PROP_ALLOW_FALLBACK_TO_SIMPLE_AUTH, "true");
+        }
+        return hdfsConf;
     }
 
     @Override
@@ -260,7 +290,7 @@ public class DFSFileSystem extends RemoteFileSystem {
             URI pathUri = URI.create(remotePath);
             Path inputFilePath = new Path(pathUri.getPath());
             FileSystem fileSystem = nativeFileSystem(remotePath);
-            boolean isPathExist = fileSystem.exists(inputFilePath);
+            boolean isPathExist = authenticator.doAs(() -> fileSystem.exists(inputFilePath));
             if (!isPathExist) {
                 return new Status(Status.ErrCode.NOT_FOUND, "remote path does not exist: " + remotePath);
             }
@@ -375,7 +405,7 @@ public class DFSFileSystem extends RemoteFileSystem {
             FileSystem fileSystem = nativeFileSystem(destPath);
             Path srcfilePath = new Path(srcPathUri.getPath());
             Path destfilePath = new Path(destPathUri.getPath());
-            boolean isRenameSuccess = fileSystem.rename(srcfilePath, destfilePath);
+            boolean isRenameSuccess = authenticator.doAs(() -> fileSystem.rename(srcfilePath, destfilePath));
             if (!isRenameSuccess) {
                 return new Status(Status.ErrCode.COMMON_ERROR, "failed to rename " + srcPath + " to " + destPath);
             }
@@ -391,76 +421,12 @@ public class DFSFileSystem extends RemoteFileSystem {
     }
 
     @Override
-    public void asyncRename(
-            Executor executor,
-            List<CompletableFuture<?>> renameFileFutures,
-            AtomicBoolean cancelled,
-            String origFilePath,
-            String destFilePath,
-            List<String> fileNames) {
-
-        for (String fileName : fileNames) {
-            Path source = new Path(origFilePath, fileName);
-            Path target = new Path(destFilePath, fileName);
-            renameFileFutures.add(CompletableFuture.runAsync(() -> {
-                if (cancelled.get()) {
-                    return;
-                }
-                Status status = rename(source.toString(), target.toString());
-                if (!status.ok()) {
-                    throw new RuntimeException(status.getErrMsg());
-                }
-            }, executor));
-        }
-    }
-
-    public Status renameDir(String origFilePath,
-                            String destFilePath,
-                            Runnable runWhenPathNotExist) {
-        Status status = exists(destFilePath);
-        if (status.ok()) {
-            throw new RuntimeException("Destination directory already exists: " + destFilePath);
-        }
-
-        String targetParent = new Path(destFilePath).getParent().toString();
-        status = exists(targetParent);
-        if (Status.ErrCode.NOT_FOUND.equals(status.getErrCode())) {
-            status = makeDir(targetParent);
-        }
-        if (!status.ok()) {
-            throw new RuntimeException(status.getErrMsg());
-        }
-
-        runWhenPathNotExist.run();
-
-        return rename(origFilePath, destFilePath);
-    }
-
-    @Override
-    public void asyncRenameDir(Executor executor,
-                        List<CompletableFuture<?>> renameFileFutures,
-                        AtomicBoolean cancelled,
-                        String origFilePath,
-                        String destFilePath,
-                        Runnable runWhenPathNotExist) {
-        renameFileFutures.add(CompletableFuture.runAsync(() -> {
-            if (cancelled.get()) {
-                return;
-            }
-            Status status = renameDir(origFilePath, destFilePath, runWhenPathNotExist);
-            if (!status.ok()) {
-                throw new RuntimeException(status.getErrMsg());
-            }
-        }, executor));
-    }
-
-    @Override
     public Status delete(String remotePath) {
         try {
             URI pathUri = URI.create(remotePath);
             Path inputFilePath = new Path(pathUri.getPath());
             FileSystem fileSystem = nativeFileSystem(remotePath);
-            fileSystem.delete(inputFilePath, true);
+            authenticator.doAs(() -> fileSystem.delete(inputFilePath, true));
         } catch (UserException e) {
             return new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
         } catch (IOException e) {
@@ -481,12 +447,12 @@ public class DFSFileSystem extends RemoteFileSystem {
      * @return Status.OK if success.
      */
     @Override
-    public Status list(String remotePath, List<RemoteFile> result, boolean fileNameOnly) {
+    public Status globList(String remotePath, List<RemoteFile> result, boolean fileNameOnly) {
         try {
             URI pathUri = URI.create(remotePath);
             FileSystem fileSystem = nativeFileSystem(remotePath);
             Path pathPattern = new Path(pathUri.getPath());
-            FileStatus[] files = fileSystem.globStatus(pathPattern);
+            FileStatus[] files = authenticator.doAs(() -> fileSystem.globStatus(pathPattern));
             if (files == null) {
                 LOG.info("no files in path " + remotePath);
                 return Status.OK;
@@ -513,7 +479,7 @@ public class DFSFileSystem extends RemoteFileSystem {
     public Status makeDir(String remotePath) {
         try {
             FileSystem fileSystem = nativeFileSystem(remotePath);
-            if (!fileSystem.mkdirs(new Path(remotePath))) {
+            if (!authenticator.doAs(() -> fileSystem.mkdirs(new Path(remotePath)))) {
                 LOG.warn("failed to make dir for " + remotePath);
                 return new Status(Status.ErrCode.COMMON_ERROR, "failed to make dir for " + remotePath);
             }
@@ -522,5 +488,10 @@ public class DFSFileSystem extends RemoteFileSystem {
             return new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
         }
         return Status.OK;
+    }
+
+    @VisibleForTesting
+    public HadoopAuthenticator getAuthenticator() {
+        return authenticator;
     }
 }

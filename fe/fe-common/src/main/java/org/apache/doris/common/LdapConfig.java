@@ -21,6 +21,14 @@ package org.apache.doris.common;
  * LDAP configuration
  */
 public class LdapConfig extends ConfigBase {
+
+    /**
+     * Flag to enable LDAP authentication.
+     */
+    @Deprecated
+    @ConfigBase.ConfField
+    public static boolean ldap_authentication_enabled = false;
+
     /**
      * LDAP server ip.
      */
@@ -57,6 +65,12 @@ public class LdapConfig extends ConfigBase {
      */
     @ConfigBase.ConfField
     public static String ldap_group_basedn = "";
+
+    /**
+     * Group lookup filter, the placeholder {login} will be replaced by the user supplied login.
+     */
+    @ConfigBase.ConfField
+    public static String ldap_group_filter = "";
 
     /**
      * The user LDAP information cache time.

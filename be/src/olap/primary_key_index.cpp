@@ -17,6 +17,7 @@
 
 #include "olap/primary_key_index.h"
 
+#include <butil/time.h>
 #include <gen_cpp/segment_v2.pb.h>
 
 #include <utility>
@@ -31,6 +32,8 @@
 #include "olap/types.h"
 
 namespace doris {
+
+static bvar::Adder<size_t> g_primary_key_index_memory_bytes("doris_primary_key_index_memory_bytes");
 
 Status PrimaryKeyIndexBuilder::init() {
     // TODO(liaoxin) using the column type directly if there's only one column in unique key columns
@@ -55,7 +58,7 @@ Status PrimaryKeyIndexBuilder::init() {
 Status PrimaryKeyIndexBuilder::add_item(const Slice& key) {
     RETURN_IF_ERROR(_primary_key_index_builder->add(&key));
     Slice key_without_seq = Slice(key.get_data(), key.get_size() - _seq_col_length - _rowid_length);
-    _bloom_filter_index_builder->add_values(&key_without_seq, 1);
+    RETURN_IF_ERROR(_bloom_filter_index_builder->add_values(&key_without_seq, 1));
     // the key is already sorted, so the first key is min_key, and
     // the last key is max_key.
     if (UNLIKELY(_num_rows == 0)) {
@@ -93,7 +96,8 @@ Status PrimaryKeyIndexReader::parse_index(io::FileReaderSPtr file_reader,
     // parse primary key index
     _index_reader.reset(new segment_v2::IndexedColumnReader(file_reader, meta.primary_key_index()));
     _index_reader->set_is_pk_index(true);
-    RETURN_IF_ERROR(_index_reader->load(!config::disable_pk_storage_page_cache, false));
+    RETURN_IF_ERROR(_index_reader->load(!config::disable_pk_storage_page_cache, false,
+                                        _pk_index_load_stats));
 
     _index_parsed = true;
     return Status::OK();
@@ -105,7 +109,8 @@ Status PrimaryKeyIndexReader::parse_bf(io::FileReaderSPtr file_reader,
     segment_v2::ColumnIndexMetaPB column_index_meta = meta.bloom_filter_index();
     segment_v2::BloomFilterIndexReader bf_index_reader(std::move(file_reader),
                                                        column_index_meta.bloom_filter_index());
-    RETURN_IF_ERROR(bf_index_reader.load(!config::disable_pk_storage_page_cache, false));
+    RETURN_IF_ERROR(bf_index_reader.load(!config::disable_pk_storage_page_cache, false,
+                                         _pk_index_load_stats));
     std::unique_ptr<segment_v2::BloomFilterIndexIterator> bf_iter;
     RETURN_IF_ERROR(bf_index_reader.new_iterator(&bf_iter));
     RETURN_IF_ERROR(bf_iter->read_bloom_filter(0, &_bf));

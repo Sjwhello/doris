@@ -27,7 +27,7 @@
 #include <functional>
 
 #include "common/compiler_util.h" // IWYU pragma: keep
-#include "gutil/hash/hash.h"      // IWYU pragma: keep
+#include "gutil/hash/city.h"
 #include "runtime/define_primitive_type.h"
 #include "util/cpu_info.h"
 #include "util/murmur_hash3.h"
@@ -134,7 +134,7 @@ public:
     static const uint32_t MURMUR3_32_SEED = 104729;
 
     // modify from https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
-    static uint32_t murmur_hash3_32(const void* key, int32_t len, uint32_t seed) {
+    static uint32_t murmur_hash3_32(const void* key, int64_t len, uint32_t seed) {
         uint32_t out = 0;
         murmur_hash3_x86_32(key, len, seed, &out);
         return out;
@@ -227,7 +227,7 @@ public:
     // Our hash function is MurmurHash2, 64 bit version.
     // It was modified in order to provide the same result in
     // big and little endian archs (endian neutral).
-    static uint64_t murmur_hash64A(const void* key, int32_t len, unsigned int seed) {
+    static uint64_t murmur_hash64A(const void* key, int64_t len, unsigned int seed) {
         const uint64_t m = MURMUR_PRIME;
         const int r = 47;
         uint64_t h = seed ^ (len * m);
@@ -382,16 +382,6 @@ struct std::hash<doris::TNetworkAddress> {
     }
 };
 
-#if __GNUC__ < 6 && !defined(__clang__)
-// Cause this is builtin function
-template <>
-struct std::hash<__int128> {
-    std::size_t operator()(const __int128& val) const {
-        return doris::HashUtil::hash(&val, sizeof(val), 0);
-    }
-};
-#endif
-
 template <>
 struct std::hash<std::pair<doris::TUniqueId, int64_t>> {
     size_t operator()(const std::pair<doris::TUniqueId, int64_t>& pair) const {
@@ -400,5 +390,14 @@ struct std::hash<std::pair<doris::TUniqueId, int64_t>> {
         seed = doris::HashUtil::hash(&pair.first.hi, sizeof(pair.first.hi), seed);
         seed = doris::HashUtil::hash(&pair.second, sizeof(pair.second), seed);
         return seed;
+    }
+};
+
+template <class First, class Second>
+struct std::hash<std::pair<First, Second>> {
+    size_t operator()(const pair<First, Second>& p) const {
+        size_t h1 = std::hash<First>()(p.first);
+        size_t h2 = std::hash<Second>()(p.second);
+        return util_hash::HashLen16(h1, h2);
     }
 };

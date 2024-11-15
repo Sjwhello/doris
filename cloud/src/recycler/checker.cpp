@@ -38,14 +38,15 @@
 #include "common/bvars.h"
 #include "common/config.h"
 #include "common/encryption_util.h"
-#include "common/sync_point.h"
+#include "common/logging.h"
 #include "common/util.h"
+#include "cpp/sync_point.h"
 #include "meta-service/keys.h"
 #include "meta-service/txn_kv.h"
 #include "meta-service/txn_kv_error.h"
 #include "recycler/hdfs_accessor.h"
-#include "recycler/obj_store_accessor.h"
 #include "recycler/s3_accessor.h"
+#include "recycler/storage_vault_accessor.h"
 #ifdef UNIT_TEST
 #include "../test/mock_accessor.h"
 #endif
@@ -78,6 +79,8 @@ int Checker::start() {
 
     // launch instance scanner
     auto scanner_func = [this]() {
+        std::this_thread::sleep_for(
+                std::chrono::seconds(config::recycler_sleep_before_scheduling_seconds));
         while (!stopped()) {
             std::vector<InstanceInfoPB> instances;
             get_all_instances(txn_kv_.get(), instances);
@@ -126,8 +129,9 @@ int Checker::start() {
             long enqueue_time_s = 0;
             {
                 std::unique_lock lock(mtx_);
-                pending_instance_cond_.wait(
-                        lock, [&]() { return !pending_instance_queue_.empty() || stopped(); });
+                pending_instance_cond_.wait(lock, [&]() -> bool {
+                    return !pending_instance_queue_.empty() || stopped();
+                });
                 if (stopped()) {
                     return;
                 }
@@ -165,10 +169,20 @@ int Checker::start() {
                     duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
             g_bvar_checker_enqueue_cost_s.put(instance_id, ctime_ms / 1000 - enqueue_time_s);
             ret = checker->do_check();
+
             if (config::enable_inverted_check) {
-                if (checker->do_inverted_check() != 0) ret = -1;
+                if (ret == 0) {
+                    ret = checker->do_inverted_check();
+                }
             }
-            if (ret == -1) return;
+
+            if (ret < 0) {
+                // If ret < 0, it means that a temporary error occurred during the check process.
+                // The check job should not be considered finished, and the next round of check job
+                // should be retried as soon as possible.
+                return;
+            }
+
             // If instance checker has been aborted, don't finish this job
             if (!checker->stopped()) {
                 finish_instance_recycle_job(txn_kv_.get(), check_job_key, instance.instance_id(),
@@ -296,7 +310,6 @@ void Checker::do_inspect(const InstanceInfoPB& instance) {
                     : bucket_lifecycle_days * 86400000;
     TEST_SYNC_POINT_CALLBACK("Checker:do_inspect", &last_ctime_ms);
     if (now - last_ctime_ms >= expiration_ms) {
-        TEST_SYNC_POINT("Checker.do_inspect1");
         LOG_CHECK_INTERVAL_ALARM << "check risks, instance_id: " << instance.instance_id()
                                  << " last_ctime_ms: " << last_ctime_ms
                                  << " job_status: " << job_status
@@ -358,36 +371,27 @@ int InstanceChecker::init(const InstanceInfoPB& instance) {
 
 int InstanceChecker::init_obj_store_accessors(const InstanceInfoPB& instance) {
     for (const auto& obj_info : instance.obj_info()) {
-        S3Conf s3_conf;
-        s3_conf.ak = obj_info.ak();
-        s3_conf.sk = obj_info.sk();
-        if (obj_info.has_encryption_info()) {
-            AkSkPair plain_ak_sk_pair;
-            int ret = decrypt_ak_sk_helper(obj_info.ak(), obj_info.sk(), obj_info.encryption_info(),
-                                           &plain_ak_sk_pair);
-            if (ret != 0) {
-                LOG(WARNING) << "fail to decrypt ak sk. instance_id: " << instance_id_
-                             << " obj_info: " << proto_to_json(obj_info);
-            } else {
-                s3_conf.ak = std::move(plain_ak_sk_pair.first);
-                s3_conf.sk = std::move(plain_ak_sk_pair.second);
-            }
-        }
-        s3_conf.endpoint = obj_info.endpoint();
-        s3_conf.region = obj_info.region();
-        s3_conf.bucket = obj_info.bucket();
-        s3_conf.prefix = obj_info.prefix();
 #ifdef UNIT_TEST
-        auto accessor = std::make_shared<MockS3Accessor>(s3_conf);
+        auto accessor = std::make_shared<MockAccessor>();
 #else
-        auto accessor = std::make_shared<S3Accessor>(std::move(s3_conf));
-#endif
-        if (accessor->init() != 0) [[unlikely]] {
-            LOG(WARNING) << "failed to init s3 accessor, instance_id=" << instance.instance_id();
+        auto s3_conf = S3Conf::from_obj_store_info(obj_info);
+        if (!s3_conf) {
+            LOG(WARNING) << "failed to init object accessor, instance_id=" << instance_id_;
             return -1;
         }
+
+        std::shared_ptr<S3Accessor> accessor;
+        int ret = S3Accessor::create(std::move(*s3_conf), &accessor);
+        if (ret != 0) {
+            LOG(WARNING) << "failed to init object accessor. instance_id=" << instance_id_
+                         << " resource_id=" << obj_info.id();
+            return ret;
+        }
+#endif
+
         accessor_map_.emplace(obj_info.id(), std::move(accessor));
     }
+
     return 0;
 }
 
@@ -396,61 +400,66 @@ int InstanceChecker::init_storage_vault_accessors(const InstanceInfoPB& instance
         return 0;
     }
 
-    std::string storage_vault_start = storage_vault_key({instance_id_, ""});
-    std::string storage_vault_end = storage_vault_key({instance_id_, "\xff"});
-    std::unique_ptr<RangeGetIterator> it;
+    FullRangeGetIteratorOptions opts(txn_kv_);
+    opts.prefetch = true;
+    auto it = txn_kv_->full_range_get(storage_vault_key({instance_id_, ""}),
+                                      storage_vault_key({instance_id_, "\xff"}), std::move(opts));
 
-    do {
-        std::unique_ptr<Transaction> txn;
-        TxnErrorCode err = txn_kv_->create_txn(&txn);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG(WARNING) << "failed to create txn. instance_id=" << instance.instance_id();
-            return -1;
-        }
-        err = txn->get(storage_vault_start, storage_vault_end, &it, true);
-        if (err != TxnErrorCode::TXN_OK) {
-            LOG(WARNING) << "failed to get storage vault, instance_id=" << instance_id_;
+    for (auto kv = it->next(); kv.has_value(); kv = it->next()) {
+        auto [k, v] = *kv;
+        StorageVaultPB vault;
+        if (!vault.ParseFromArray(v.data(), v.size())) {
+            LOG(WARNING) << "malformed storage vault, unable to deserialize key=" << hex(k);
             return -1;
         }
 
-        while (it->has_next()) {
-            auto [k, v] = it->next();
-            StorageVaultPB vault;
-            if (!vault.ParseFromArray(v.data(), v.size())) {
-                LOG(WARNING) << "malformed storage vault, unable to deserialize key=" << hex(k);
+        if (vault.has_hdfs_info()) {
+            auto accessor = std::make_shared<HdfsAccessor>(vault.hdfs_info());
+            int ret = accessor->init();
+            if (ret != 0) {
+                LOG(WARNING) << "failed to init hdfs accessor. instance_id=" << instance_id_
+                             << " resource_id=" << vault.id() << " name=" << vault.name();
+                return ret;
+            }
+
+            accessor_map_.emplace(vault.id(), std::move(accessor));
+        } else if (vault.has_obj_info()) {
+#ifdef UNIT_TEST
+            auto accessor = std::make_shared<MockAccessor>();
+#else
+            auto s3_conf = S3Conf::from_obj_store_info(vault.obj_info());
+            if (!s3_conf) {
+                LOG(WARNING) << "failed to init object accessor, instance_id=" << instance_id_;
                 return -1;
             }
 
-            if (vault.has_hdfs_info()) {
-                auto accessor = std::make_shared<HdfsAccessor>(vault.hdfs_info());
-                int ret = accessor->init();
-                if (ret != 0) {
-                    LOG(WARNING) << "failed to init hdfs accessor. instance_id=" << instance_id_
-                                 << " resource_id=" << vault.id() << " name=" << vault.name();
-                    return ret;
-                }
-
-                accessor_map_.emplace(vault.id(), std::move(accessor));
+            std::shared_ptr<S3Accessor> accessor;
+            int ret = S3Accessor::create(std::move(*s3_conf), &accessor);
+            if (ret != 0) {
+                LOG(WARNING) << "failed to init s3 accessor. instance_id=" << instance_id_
+                             << " resource_id=" << vault.id() << " name=" << vault.name();
+                return ret;
             }
-            // TODO: more vault type
+#endif
 
-            if (!it->has_next()) {
-                storage_vault_start = k;
-            }
+            accessor_map_.emplace(vault.id(), std::move(accessor));
         }
-        storage_vault_start.push_back('\x00'); // Update to next smallest key for iteration
+    }
 
-    } while (it->more());
-
+    if (!it->is_valid()) {
+        LOG_WARNING("failed to get storage vault kv");
+        return -1;
+    }
     return 0;
 }
 
 int InstanceChecker::do_check() {
     TEST_SYNC_POINT("InstanceChecker.do_check");
     LOG(INFO) << "begin to check instance objects instance_id=" << instance_id_;
+    int check_ret = 0;
     long num_scanned = 0;
     long num_scanned_with_segment = 0;
-    long num_check_failed = 0;
+    long num_rowset_loss = 0;
     long instance_volume = 0;
     using namespace std::chrono;
     auto start_time = steady_clock::now();
@@ -459,11 +468,11 @@ int InstanceChecker::do_check() {
         LOG(INFO) << "check instance objects finished, cost=" << cost
                   << "s. instance_id=" << instance_id_ << " num_scanned=" << num_scanned
                   << " num_scanned_with_segment=" << num_scanned_with_segment
-                  << " num_check_failed=" << num_check_failed
+                  << " num_rowset_loss=" << num_rowset_loss
                   << " instance_volume=" << instance_volume;
         g_bvar_checker_num_scanned.put(instance_id_, num_scanned);
         g_bvar_checker_num_scanned_with_segment.put(instance_id_, num_scanned_with_segment);
-        g_bvar_checker_num_check_failed.put(instance_id_, num_check_failed);
+        g_bvar_checker_num_check_failed.put(instance_id_, num_rowset_loss);
         g_bvar_checker_check_cost_s.put(instance_id_, static_cast<long>(cost));
         // FIXME(plat1ko): What if some list operation failed?
         g_bvar_checker_instance_volume.put(instance_id_, instance_volume);
@@ -477,7 +486,10 @@ int InstanceChecker::do_check() {
 
     auto check_rowset_objects = [&, this](const doris::RowsetMetaCloudPB& rs_meta,
                                           std::string_view key) {
-        if (rs_meta.num_segments() == 0) return;
+        if (rs_meta.num_segments() == 0) {
+            return;
+        }
+
         ++num_scanned_with_segment;
         if (tablet_files_cache.tablet_id != rs_meta.tablet_id()) {
             long tablet_volume = 0;
@@ -485,32 +497,50 @@ int InstanceChecker::do_check() {
             tablet_files_cache.tablet_id = 0;
             tablet_files_cache.files.clear();
             // Get all file paths under this tablet directory
-            for (auto& [_, accessor] : accessor_map_) {
-                std::vector<ObjectMeta> files;
-                int ret = accessor->list(tablet_path_prefix(rs_meta.tablet_id()), &files);
-                if (ret != 0) { // No need to log, because S3Accessor has logged this error
-                    ++num_check_failed;
-                    return;
-                }
-                for (auto& file : files) {
-                    tablet_files_cache.files.insert(std::move(file.path));
-                    tablet_volume += file.size;
-                }
+            auto find_it = accessor_map_.find(rs_meta.resource_id());
+            if (find_it == accessor_map_.end()) {
+                LOG_WARNING("resource id not found in accessor map")
+                        .tag("resource_id", rs_meta.resource_id())
+                        .tag("tablet_id", rs_meta.tablet_id())
+                        .tag("rowset_id", rs_meta.rowset_id_v2());
+                check_ret = -1;
+                return;
+            }
+
+            std::unique_ptr<ListIterator> list_iter;
+            int ret = find_it->second->list_directory(tablet_path_prefix(rs_meta.tablet_id()),
+                                                      &list_iter);
+            if (ret != 0) { // No need to log, because S3Accessor has logged this error
+                check_ret = -1;
+                return;
+            }
+
+            for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
+                tablet_files_cache.files.insert(std::move(file->path));
+                tablet_volume += file->size;
             }
             tablet_files_cache.tablet_id = rs_meta.tablet_id();
             instance_volume += tablet_volume;
         }
 
+        bool data_loss = false;
         for (int i = 0; i < rs_meta.num_segments(); ++i) {
             auto path = segment_path(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i);
-            if (tablet_files_cache.files.count(path)) continue;
-            if (1 == key_exist(txn_kv_.get(), key)) {
-                // Rowset has been deleted instead of data loss
+            if (tablet_files_cache.files.contains(path)) {
                 continue;
             }
-            ++num_check_failed;
+
+            if (1 == key_exist(txn_kv_.get(), key)) {
+                // Rowset has been deleted instead of data loss
+                break;
+            }
+            data_loss = true;
             TEST_SYNC_POINT_CALLBACK("InstanceChecker.do_check1", &path);
             LOG(WARNING) << "object not exist, path=" << path << " key=" << hex(key);
+        }
+
+        if (data_loss) {
+            ++num_rowset_loss;
         }
     };
 
@@ -540,7 +570,7 @@ int InstanceChecker::do_check() {
 
             doris::RowsetMetaCloudPB rs_meta;
             if (!rs_meta.ParseFromArray(v.data(), v.size())) {
-                ++num_check_failed;
+                ++num_rowset_loss;
                 LOG(WARNING) << "malformed rowset meta. key=" << hex(k) << " val=" << hex(v);
                 continue;
             }
@@ -548,22 +578,32 @@ int InstanceChecker::do_check() {
         }
         start_key.push_back('\x00'); // Update to next smallest key for iteration
     } while (it->more() && !stopped());
-    return num_check_failed == 0 ? 0 : -2;
+
+    return num_rowset_loss > 0 ? 1 : check_ret;
 }
 
 int InstanceChecker::get_bucket_lifecycle(int64_t* lifecycle_days) {
     // If there are multiple buckets, return the minimum lifecycle.
     int64_t min_lifecycle_days = INT64_MAX;
     int64_t tmp_liefcycle_days = 0;
-    for (const auto& [obj_info, accessor] : accessor_map_) {
+    for (const auto& [id, accessor] : accessor_map_) {
         if (accessor->type() != AccessorType::S3) {
             continue;
         }
 
         auto* s3_accessor = static_cast<S3Accessor*>(accessor.get());
-        if (s3_accessor->check_bucket_versioning() != 0) return -1;
-        if (s3_accessor->get_bucket_lifecycle(&tmp_liefcycle_days) != 0) return -1;
-        if (tmp_liefcycle_days < min_lifecycle_days) min_lifecycle_days = tmp_liefcycle_days;
+
+        if (s3_accessor->check_versioning() != 0) {
+            return -1;
+        }
+
+        if (s3_accessor->get_life_cycle(&tmp_liefcycle_days) != 0) {
+            return -1;
+        }
+
+        if (tmp_liefcycle_days < min_lifecycle_days) {
+            min_lifecycle_days = tmp_liefcycle_days;
+        }
     }
     *lifecycle_days = min_lifecycle_days;
     return 0;
@@ -577,15 +617,18 @@ int InstanceChecker::do_inverted_check() {
     }
 
     LOG(INFO) << "begin to inverted check objects instance_id=" << instance_id_;
+    int check_ret = 0;
     long num_scanned = 0;
-    long num_check_failed = 0;
+    long num_file_leak = 0;
     using namespace std::chrono;
     auto start_time = steady_clock::now();
     std::unique_ptr<int, std::function<void(int*)>> defer_log_statistics((int*)0x01, [&](int*) {
+        g_bvar_inverted_checker_num_scanned.put(instance_id_, num_scanned);
+        g_bvar_inverted_checker_num_check_failed.put(instance_id_, num_file_leak);
         auto cost = duration<float>(steady_clock::now() - start_time).count();
         LOG(INFO) << "inverted check instance objects finished, cost=" << cost
                   << "s. instance_id=" << instance_id_ << " num_scanned=" << num_scanned
-                  << " num_check_failed=" << num_check_failed;
+                  << " num_file_leak=" << num_file_leak;
     });
 
     struct TabletRowsets {
@@ -594,18 +637,21 @@ int InstanceChecker::do_inverted_check() {
     };
     TabletRowsets tablet_rowsets_cache;
 
-    auto check_object_key = [&](const std::string& obj_key) {
+    // Return 0 if check success, return 1 if file is garbage data, negative if error occurred
+    auto check_segment_file = [&](const std::string& obj_key) {
         std::vector<std::string> str;
         butil::SplitString(obj_key, '/', &str);
-        // {prefix}/data/{tablet_id}/{rowset_id}_{seg_num}.dat
-        if (str.size() < 4) {
+        // data/{tablet_id}/{rowset_id}_{seg_num}.dat
+        if (str.size() < 3) {
             return -1;
         }
-        int64_t tablet_id = atol((str.end() - 2)->c_str());
+
+        int64_t tablet_id = atol(str[1].c_str());
         if (tablet_id <= 0) {
             LOG(WARNING) << "failed to parse tablet_id, key=" << obj_key;
             return -1;
         }
+
         std::string rowset_id;
         if (auto pos = str.back().find('_'); pos != std::string::npos) {
             rowset_id = str.back().substr(0, pos);
@@ -613,8 +659,9 @@ int InstanceChecker::do_inverted_check() {
             LOG(WARNING) << "failed to parse rowset_id, key=" << obj_key;
             return -1;
         }
+
         if (tablet_rowsets_cache.tablet_id == tablet_id) {
-            if (tablet_rowsets_cache.rowset_ids.count(rowset_id) > 0) {
+            if (tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
                 return 0;
             } else {
                 LOG(WARNING) << "rowset not exists, key=" << obj_key;
@@ -658,59 +705,47 @@ int InstanceChecker::do_inverted_check() {
                 }
             }
         } while (it->more() && !stopped());
-        if (tablet_rowsets_cache.rowset_ids.count(rowset_id) > 0) {
-            return 0;
-        } else {
-            LOG(WARNING) << "rowset not exists, key=" << obj_key;
-            return -1;
+
+        if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
+            // Garbage data leak
+            LOG(WARNING) << "rowset should be recycled, key=" << obj_key;
+            return 1;
         }
+
         return 0;
     };
 
     // TODO(Xiaocc): Currently we haven't implemented one generator-like s3 accessor list function
     // so we choose to skip here.
-    {
-        [[maybe_unused]] int tmp_ret = 0;
-        TEST_SYNC_POINT_RETURN_WITH_VALUE("InstanceChecker::do_inverted_check", &tmp_ret);
-    }
+    TEST_SYNC_POINT_RETURN_WITH_VALUE("InstanceChecker::do_inverted_check", (int)0);
+
     for (auto& [_, accessor] : accessor_map_) {
-        if (accessor->type() != AccessorType::S3) {
-            // FIXME(plat1ko): List hdfs accessor in current path style (i.e.
-            // data/{tablet_id}/{rowset_id}_{seg_num}.dat ) will consume too much memory if there
-            // are huge number of tablets.
-            continue;
+        std::unique_ptr<ListIterator> list_iter;
+        int ret = accessor->list_directory("data", &list_iter);
+        if (ret != 0) {
+            return -1;
         }
 
-        auto* s3_accessor = static_cast<S3Accessor*>(accessor.get());
-        auto client = s3_accessor->s3_client();
-        const auto& conf = s3_accessor->conf();
-        Aws::S3::Model::ListObjectsV2Request request;
-        request.WithBucket(conf.bucket).WithPrefix(conf.prefix + "/data/");
-        bool is_truncated = false;
-        do {
-            auto outcome = client->ListObjectsV2(request);
-            if (!outcome.IsSuccess()) {
-                LOG(WARNING) << "failed to list objects, endpoint=" << conf.endpoint
-                             << " bucket=" << conf.bucket << " prefix=" << request.GetPrefix();
-                return -1;
-            }
-            LOG(INFO) << "get " << outcome.GetResult().GetContents().size()
-                      << " objects, endpoint=" << conf.endpoint << " bucket=" << conf.bucket
-                      << " prefix=" << request.GetPrefix();
-            const auto& result = outcome.GetResult();
-            num_scanned += result.GetContents().size();
-            for (const auto& obj : result.GetContents()) {
-                if (check_object_key(obj.GetKey()) != 0) {
-                    LOG(WARNING) << "failed to check object key, endpoint=" << conf.endpoint
-                                 << " bucket=" << conf.bucket << " key=" << obj.GetKey();
-                    ++num_check_failed;
+        for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
+            ++num_scanned;
+            int ret = check_segment_file(file->path);
+            if (ret != 0) {
+                LOG(WARNING) << "failed to check segment file, uri=" << accessor->uri()
+                             << " path=" << file->path;
+                if (ret == 1) {
+                    ++num_file_leak;
+                } else {
+                    check_ret = -1;
                 }
             }
-            is_truncated = result.GetIsTruncated();
-            request.SetContinuationToken(result.GetNextContinuationToken());
-        } while (is_truncated && !stopped());
+        }
+
+        if (!list_iter->is_valid()) {
+            LOG(WARNING) << "failed to list data directory. uri=" << accessor->uri();
+            return -1;
+        }
     }
-    return num_check_failed == 0 ? 0 : -1;
+    return num_file_leak > 0 ? 1 : check_ret;
 }
 
 } // namespace doris::cloud

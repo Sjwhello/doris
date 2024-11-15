@@ -28,7 +28,7 @@ suite("stress_test_diff_date_list", "p2,nonConcurrent") {
     // get doris-db from s3
     def dirPath = context.file.parent
     def fileName = "doris-dbgen"
-    def fileUrl = "http://doris-build-1308700295.cos.ap-beijing.myqcloud.com/regression/doris-dbgen-23-10-18/doris-dbgen-23-10-20/doris-dbgen"
+    def fileUrl = "http://${getS3BucketName()}.${getS3Endpoint()}/regression/doris-dbgen-23-10-18/doris-dbgen-23-10-20/doris-dbgen"
     def filePath = Paths.get(dirPath, fileName)
     if (!Files.exists(filePath)) {
         new URL(fileUrl).withInputStream { inputStream ->
@@ -78,7 +78,6 @@ suite("stress_test_diff_date_list", "p2,nonConcurrent") {
         proc.consumeProcessOutput(sout, serr)
         proc.waitForOrKill(7200000)
         logger.info("std out: " + sout + "std err: " + serr)
-
     }
 
     def write_to_file = { cur_path, content ->

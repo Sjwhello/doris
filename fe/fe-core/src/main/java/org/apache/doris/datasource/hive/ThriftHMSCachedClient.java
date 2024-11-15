@@ -18,7 +18,9 @@
 package org.apache.doris.datasource.hive;
 
 import org.apache.doris.analysis.TableName;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.security.authentication.HadoopAuthenticator;
 import org.apache.doris.datasource.DatabaseMetadata;
 import org.apache.doris.datasource.TableMetadata;
 import org.apache.doris.datasource.hive.event.MetastoreNotificationFetchException;
@@ -27,11 +29,8 @@ import org.apache.doris.datasource.property.constants.HMSProperties;
 import com.aliyun.datalake.metastore.hive2.ProxyMetaStoreClient;
 import com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
-import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.common.ValidReaderWriteIdList;
 import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.common.ValidTxnWriteIdList;
@@ -49,6 +48,7 @@ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
 import org.apache.hadoop.hive.metastore.api.DataOperationType;
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.DefaultConstraintsRequest;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.LockComponent;
 import org.apache.hadoop.hive.metastore.api.LockResponse;
@@ -56,20 +56,22 @@ import org.apache.hadoop.hive.metastore.api.LockState;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.hadoop.hive.metastore.api.Partition;
-import org.apache.hadoop.hive.metastore.api.SerDeInfo;
-import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.api.SQLDefaultConstraint;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.TableValidWriteIds;
 import org.apache.hadoop.hive.metastore.txn.TxnUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import shade.doris.hive.org.apache.thrift.TApplicationException;
 
 import java.security.PrivilegedExceptionAction;
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
@@ -88,8 +90,10 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     private static final short MAX_LIST_PARTITION_NUM = Config.max_hive_list_partition_num;
 
     private Queue<ThriftHMSClient> clientPool = new LinkedList<>();
+    private boolean isClosed = false;
     private final int poolSize;
     private final HiveConf hiveConf;
+    private HadoopAuthenticator hadoopAuthenticator;
 
     public ThriftHMSCachedClient(HiveConf hiveConf, int poolSize) {
         Preconditions.checkArgument(poolSize > 0, poolSize);
@@ -99,6 +103,25 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         }
         this.hiveConf = hiveConf;
         this.poolSize = poolSize;
+        this.isClosed = false;
+    }
+
+    public void setHadoopAuthenticator(HadoopAuthenticator hadoopAuthenticator) {
+        this.hadoopAuthenticator = hadoopAuthenticator;
+    }
+
+    @Override
+    public void close() {
+        synchronized (clientPool) {
+            this.isClosed = true;
+            while (!clientPool.isEmpty()) {
+                try {
+                    clientPool.poll().close();
+                } catch (Exception e) {
+                    LOG.warn("failed to close thrift client", e);
+                }
+            }
+        }
     }
 
     @Override
@@ -159,8 +182,28 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
             try {
                 // String location,
                 if (tbl instanceof HiveTableMetadata) {
+                    Table hiveTable = HiveUtil.toHiveTable((HiveTableMetadata) tbl);
+                    List<Column> tableColumns = ((HiveTableMetadata) tbl).getColumns();
+                    List<SQLDefaultConstraint> dvs = new ArrayList<>(tableColumns.size());
+                    for (Column tableColumn : tableColumns) {
+                        if (tableColumn.hasDefaultValue()) {
+                            SQLDefaultConstraint dv = new SQLDefaultConstraint();
+                            dv.setTable_db(tbl.getDbName());
+                            dv.setTable_name(tbl.getTableName());
+                            dv.setColumn_name(tableColumn.getName());
+                            dv.setDefault_value(tableColumn.getDefaultValue());
+                            dv.setDc_name(tableColumn.getName() + "_dv_constraint");
+                            dvs.add(dv);
+                        }
+                    }
                     ugiDoAs(() -> {
-                        client.client.createTable(HiveUtil.toHiveTable((HiveTableMetadata) tbl));
+                        if (!dvs.isEmpty()) {
+                            // foreignKeys, uniqueConstraints, notNullConstraints, defaultConstraints, checkConstraints
+                            client.client.createTableWithConstraints(hiveTable, null,
+                                    null, null, null, dvs, null);
+                            return null;
+                        }
+                        client.client.createTable(hiveTable);
                         return null;
                     });
                 }
@@ -169,7 +212,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
                 throw e;
             }
         } catch (Exception e) {
-            throw new HMSClientException("failed to create database from hms client", e);
+            throw new HMSClientException("failed to create table from hms client", e);
         }
     }
 
@@ -208,6 +251,23 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     }
 
     @Override
+    public void truncateTable(String dbName, String tblName, List<String> partitions) {
+        try (ThriftHMSClient client = getClient()) {
+            try {
+                ugiDoAs(() -> {
+                    client.client.truncateTable(dbName, tblName, partitions);
+                    return null;
+                });
+            } catch (Exception e) {
+                client.setThrowable(e);
+                throw e;
+            }
+        } catch (Exception e) {
+            throw new HMSClientException("failed to truncate table %s in db %s.", e, tblName, dbName);
+        }
+    }
+
+    @Override
     public boolean tableExists(String dbName, String tblName) {
         try (ThriftHMSClient client = getClient()) {
             try {
@@ -235,7 +295,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
                 throw e;
             }
         } catch (Exception e) {
-            throw new HMSClientException("failed to check if table %s in db %s exists", e, tblName, dbName);
+            throw new HMSClientException("failed to list partitions in table '%s.%s'.", e, dbName, tblName);
         }
     }
 
@@ -265,8 +325,15 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
                 throw e;
             }
         } catch (Exception e) {
-            throw new HMSClientException("failed to get partition for table %s in db %s with value %s", e, tblName,
-                    dbName, partitionValues);
+            // Avoid printing too much log
+            String partitionValuesMsg;
+            if (partitionValues.size() <= 3) {
+                partitionValuesMsg = partitionValues.toString();
+            } else {
+                partitionValuesMsg = partitionValues.subList(0, 3) + "... total: " + partitionValues.size();
+            }
+            throw new HMSClientException("failed to get partition for table %s in db %s with value [%s]", e, tblName,
+                    dbName, partitionValuesMsg);
         }
     }
 
@@ -280,8 +347,15 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
                 throw e;
             }
         } catch (Exception e) {
-            throw new HMSClientException("failed to get partition for table %s in db %s with value %s", e, tblName,
-                    dbName, partitionNames);
+            // Avoid printing too much log
+            String partitionNamesMsg;
+            if (partitionNames.size() <= 3) {
+                partitionNamesMsg = partitionNames.toString();
+            } else {
+                partitionNamesMsg = partitionNames.subList(0, 3) + "... total: " + partitionNames.size();
+            }
+            throw new HMSClientException("failed to get partitions for table %s in db %s with value [%s]", e, tblName,
+                    dbName, partitionNamesMsg);
         }
     }
 
@@ -296,6 +370,37 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
             }
         } catch (Exception e) {
             throw new HMSClientException("failed to get database %s from hms client", e, dbName);
+        }
+    }
+
+    public Map<String, String> getDefaultColumnValues(String dbName, String tblName) {
+        Map<String, String> res = new HashMap<>();
+        try (ThriftHMSClient client = getClient()) {
+            try {
+                DefaultConstraintsRequest req = new DefaultConstraintsRequest();
+                req.setDb_name(dbName);
+                req.setTbl_name(tblName);
+                List<SQLDefaultConstraint> dvcs = ugiDoAs(() -> {
+                    try {
+                        return client.client.getDefaultConstraints(req);
+                    } catch (TApplicationException e) {
+                        if (e.getMessage().contains("Invalid method name: 'get_default_constraints'")) {
+                            // the getDefaultConstraints method only supported on hive3
+                            return ImmutableList.of();
+                        }
+                        throw e;
+                    }
+                });
+                for (SQLDefaultConstraint dvc : dvcs) {
+                    res.put(dvc.getColumn_name().toLowerCase(Locale.ROOT), dvc.getDefault_value());
+                }
+                return res;
+            } catch (Exception e) {
+                client.setThrowable(e);
+                throw e;
+            }
+        } catch (Exception e) {
+            throw new HMSClientException("failed to get table %s in db %s from hms client", e, tblName, dbName);
         }
     }
 
@@ -552,7 +657,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         @Override
         public void close() throws Exception {
             synchronized (clientPool) {
-                if (throwable != null || clientPool.size() > poolSize) {
+                if (isClosed || throwable != null || clientPool.size() > poolSize) {
                     client.close();
                 } else {
                     clientPool.offer(this);
@@ -593,7 +698,11 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     }
 
     private <T> T ugiDoAs(PrivilegedExceptionAction<T> action) {
-        return HiveMetaStoreClientHelper.ugiDoAs(hiveConf, action);
+        try {
+            return hadoopAuthenticator.doAs(action);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
@@ -605,16 +714,16 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
 
             Table originTable = getTable(dbName, tableName);
             Map<String, String> originParams = originTable.getParameters();
-            HivePartitionStatistics updatedStats = update.apply(toHivePartitionStatistics(originParams));
+            HivePartitionStatistics updatedStats = update.apply(HiveUtil.toHivePartitionStatistics(originParams));
 
             Table newTable = originTable.deepCopy();
             Map<String, String> newParams =
-                    updateStatisticsParameters(originParams, updatedStats.getCommonStatistics());
+                    HiveUtil.updateStatisticsParameters(originParams, updatedStats.getCommonStatistics());
             newParams.put("transient_lastDdlTime", String.valueOf(System.currentTimeMillis() / 1000));
             newTable.setParameters(newParams);
             client.client.alter_table(dbName, tableName, newTable);
         } catch (Exception e) {
-            throw new RuntimeException("failed to update table statistics for " + dbName + "." + tableName);
+            throw new RuntimeException("failed to update table statistics for " + dbName + "." + tableName, e);
         }
     }
 
@@ -633,16 +742,16 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
 
             Partition originPartition = partitions.get(0);
             Map<String, String> originParams = originPartition.getParameters();
-            HivePartitionStatistics updatedStats = update.apply(toHivePartitionStatistics(originParams));
+            HivePartitionStatistics updatedStats = update.apply(HiveUtil.toHivePartitionStatistics(originParams));
 
             Partition modifiedPartition = originPartition.deepCopy();
             Map<String, String> newParams =
-                    updateStatisticsParameters(originParams, updatedStats.getCommonStatistics());
+                    HiveUtil.updateStatisticsParameters(originParams, updatedStats.getCommonStatistics());
             newParams.put("transient_lastDdlTime", String.valueOf(System.currentTimeMillis() / 1000));
             modifiedPartition.setParameters(newParams);
             client.client.alter_partition(dbName, tableName, modifiedPartition);
         } catch (Exception e) {
-            throw new RuntimeException("failed to update table statistics for " + dbName + "." + tableName);
+            throw new RuntimeException("failed to update table statistics for " + dbName + "." + tableName, e);
         }
     }
 
@@ -650,7 +759,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     public void addPartitions(String dbName, String tableName, List<HivePartitionWithStatistics> partitions) {
         try (ThriftHMSClient client = getClient()) {
             List<Partition> hivePartitions = partitions.stream()
-                    .map(ThriftHMSCachedClient::toMetastoreApiPartition)
+                    .map(HiveUtil::toMetastoreApiPartition)
                     .collect(Collectors.toList());
             client.client.add_partitions(hivePartitions);
         } catch (Exception e) {
@@ -663,67 +772,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         try (ThriftHMSClient client = getClient()) {
             client.client.dropPartition(dbName, tableName, partitionValues, deleteData);
         } catch (Exception e) {
-            throw new RuntimeException("failed to drop partition for " + dbName + "." + tableName);
+            throw new RuntimeException("failed to drop partition for " + dbName + "." + tableName, e);
         }
     }
-
-    private static HivePartitionStatistics toHivePartitionStatistics(Map<String, String> params) {
-        long rowCount = Long.parseLong(params.getOrDefault(StatsSetupConst.ROW_COUNT, "-1"));
-        long totalSize = Long.parseLong(params.getOrDefault(StatsSetupConst.TOTAL_SIZE, "-1"));
-        long numFiles = Long.parseLong(params.getOrDefault(StatsSetupConst.NUM_FILES, "-1"));
-        return HivePartitionStatistics.fromCommonStatistics(rowCount, numFiles, totalSize);
-    }
-
-    private static Map<String, String> updateStatisticsParameters(
-            Map<String, String> parameters,
-            HiveCommonStatistics statistics) {
-        HashMap<String, String> result = new HashMap<>(parameters);
-
-        result.put(StatsSetupConst.NUM_FILES, String.valueOf(statistics.getFileCount()));
-        result.put(StatsSetupConst.ROW_COUNT, String.valueOf(statistics.getRowCount()));
-        result.put(StatsSetupConst.TOTAL_SIZE, String.valueOf(statistics.getTotalFileBytes()));
-
-        // CDH 5.16 metastore ignores stats unless STATS_GENERATED_VIA_STATS_TASK is set
-        // https://github.com/cloudera/hive/blob/cdh5.16.2-release/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java#L227-L231
-        if (!parameters.containsKey("STATS_GENERATED_VIA_STATS_TASK")) {
-            result.put("STATS_GENERATED_VIA_STATS_TASK", "workaround for potential lack of HIVE-12730");
-        }
-
-        return result;
-    }
-
-    public static Partition toMetastoreApiPartition(HivePartitionWithStatistics partitionWithStatistics) {
-        Partition partition =
-                toMetastoreApiPartition(partitionWithStatistics.getPartition());
-        partition.setParameters(updateStatisticsParameters(
-                partition.getParameters(), partitionWithStatistics.getStatistics().getCommonStatistics()));
-        return partition;
-    }
-
-    public static Partition toMetastoreApiPartition(HivePartition hivePartition) {
-        Partition result = new Partition();
-        result.setDbName(hivePartition.getDbName());
-        result.setTableName(hivePartition.getTblName());
-        result.setValues(hivePartition.getPartitionValues());
-        result.setSd(makeStorageDescriptorFromHivePartition(hivePartition));
-        result.setParameters(hivePartition.getParameters());
-        return result;
-    }
-
-    private static StorageDescriptor makeStorageDescriptorFromHivePartition(HivePartition partition) {
-        SerDeInfo serdeInfo = new SerDeInfo();
-        serdeInfo.setName(partition.getTblName());
-        serdeInfo.setSerializationLib(partition.getSerde());
-
-        StorageDescriptor sd = new StorageDescriptor();
-        sd.setLocation(Strings.emptyToNull(partition.getPath()));
-        sd.setCols(partition.getColumns());
-        sd.setSerdeInfo(serdeInfo);
-        sd.setInputFormat(partition.getInputFormat());
-        sd.setOutputFormat(partition.getOutputFormat());
-        sd.setParameters(ImmutableMap.of());
-
-        return sd;
-    }
-
 }

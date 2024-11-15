@@ -19,13 +19,14 @@ package org.apache.doris.nereids.trees.plans;
 
 import org.apache.doris.nereids.analyzer.Unbound;
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.properties.FunctionalDependencies;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.UnboundLogicalProperties;
 import org.apache.doris.nereids.trees.AbstractTreeNode;
 import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
+import org.apache.doris.nereids.trees.plans.TreeStringPlan.TreeStringNode;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.util.MutableState;
 import org.apache.doris.nereids.util.TreeStringUtils;
@@ -34,6 +35,7 @@ import org.apache.doris.statistics.Statistics;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -120,9 +122,31 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
     public String treeString() {
         return TreeStringUtils.treeString(this,
                 plan -> plan.toString(),
-                plan -> (List) ((Plan) plan).children(),
-                plan -> (List) ((Plan) plan).extraPlans(),
-                plan -> ((Plan) plan).displayExtraPlanFirst());
+                plan -> {
+                    if (plan instanceof TreeStringPlan) {
+                        Optional<TreeStringNode> treeStringNode = ((TreeStringPlan) plan).parseTreeStringNode();
+                        return treeStringNode.isPresent() ? ImmutableList.of(treeStringNode.get()) : ImmutableList.of();
+                    }
+                    if (plan instanceof TreeStringNode) {
+                        return (List) ((TreeStringNode) plan).children;
+                    }
+                    if (!(plan instanceof Plan)) {
+                        return ImmutableList.of();
+                    }
+                    return (List) ((Plan) plan).children();
+                },
+                plan -> {
+                    if (!(plan instanceof Plan)) {
+                        return ImmutableList.of();
+                    }
+                    return (List) ((Plan) plan).extraPlans();
+                },
+                plan -> {
+                    if (!(plan instanceof Plan)) {
+                        return false;
+                    }
+                    return ((Plan) plan).displayExtraPlanFirst();
+                });
     }
 
     /** top toJson method, can be override by specific operator */
@@ -178,9 +202,9 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
             return UnboundLogicalProperties.INSTANCE;
         } else {
             Supplier<List<Slot>> outputSupplier = Suppliers.memoize(this::computeOutput);
-            Supplier<FunctionalDependencies> fdSupplier = () -> this instanceof LogicalPlan
-                    ? ((LogicalPlan) this).computeFuncDeps(outputSupplier)
-                    : FunctionalDependencies.EMPTY_FUNC_DEPS;
+            Supplier<DataTrait> fdSupplier = () -> this instanceof LogicalPlan
+                    ? ((LogicalPlan) this).computeDataTrait()
+                    : DataTrait.EMPTY_TRAIT;
             return new LogicalProperties(outputSupplier, fdSupplier);
         }
     }
@@ -201,5 +225,9 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
             parent = ((Plan) parent.get()).getMutableState(MutableState.KEY_PARENT);
         }
         return ancestors;
+    }
+
+    public void updateActualRowCount(long actualRowCount) {
+        statistics.setActualRowCount(actualRowCount);
     }
 }

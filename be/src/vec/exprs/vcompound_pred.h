@@ -18,17 +18,21 @@
 #pragma once
 #include <gen_cpp/Opcodes_types.h>
 
+#include <algorithm>
+#include <cstdint>
+
 #include "common/status.h"
 #include "gutil/integral_types.h"
 #include "util/simd/bits.h"
 #include "vec/columns/column.h"
 #include "vec/columns/columns_number.h"
 #include "vec/common/assert_cast.h"
-#include "vec/data_types/data_type_number.h"
 #include "vec/exprs/vectorized_fn_call.h"
-#include "vec/exprs/vexpr.h"
+#include "vec/exprs/vexpr_context.h"
+#include "vec/exprs/vexpr_fwd.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 inline std::string compound_operator_to_string(TExprOpcode::type op) {
     if (op == TExprOpcode::COMPOUND_AND) {
@@ -53,8 +57,108 @@ public:
 
     const std::string& expr_name() const override { return _expr_name; }
 
+    Status evaluate_inverted_index(VExprContext* context, uint32_t segment_num_rows) override {
+        segment_v2::InvertedIndexResultBitmap res;
+        bool all_pass = true;
+
+        switch (_op) {
+        case TExprOpcode::COMPOUND_OR: {
+            for (const auto& child : _children) {
+                if (Status st = child->evaluate_inverted_index(context, segment_num_rows);
+                    !st.ok()) {
+                    LOG(ERROR) << "expr:" << child->expr_name()
+                               << " evaluate_inverted_index error:" << st.to_string();
+                    all_pass = false;
+                    continue;
+                }
+                if (context->get_inverted_index_context()->has_inverted_index_result_for_expr(
+                            child.get())) {
+                    const auto* index_result =
+                            context->get_inverted_index_context()
+                                    ->get_inverted_index_result_for_expr(child.get());
+                    if (res.is_empty()) {
+                        res = *index_result;
+                    } else {
+                        res |= *index_result;
+                    }
+                    if (res.get_data_bitmap()->cardinality() == segment_num_rows) {
+                        break; // Early exit if result is full
+                    }
+                } else {
+                    all_pass = false;
+                }
+            }
+            break;
+        }
+        case TExprOpcode::COMPOUND_AND: {
+            for (const auto& child : _children) {
+                if (Status st = child->evaluate_inverted_index(context, segment_num_rows);
+                    !st.ok()) {
+                    LOG(ERROR) << "expr:" << child->expr_name()
+                               << " evaluate_inverted_index error:" << st.to_string();
+                    all_pass = false;
+                    continue;
+                }
+                if (context->get_inverted_index_context()->has_inverted_index_result_for_expr(
+                            child.get())) {
+                    const auto* index_result =
+                            context->get_inverted_index_context()
+                                    ->get_inverted_index_result_for_expr(child.get());
+                    if (res.is_empty()) {
+                        res = *index_result;
+                    } else {
+                        res &= *index_result;
+                    }
+
+                    if (res.get_data_bitmap()->isEmpty()) {
+                        break; // Early exit if result is empty
+                    }
+                } else {
+                    all_pass = false;
+                }
+            }
+            break;
+        }
+        case TExprOpcode::COMPOUND_NOT: {
+            const auto& child = _children[0];
+            Status st = child->evaluate_inverted_index(context, segment_num_rows);
+            if (!st.ok()) {
+                LOG(ERROR) << "expr:" << child->expr_name()
+                           << " evaluate_inverted_index error:" << st.to_string();
+                return st;
+            }
+
+            if (context->get_inverted_index_context()->has_inverted_index_result_for_expr(
+                        child.get())) {
+                const auto* index_result =
+                        context->get_inverted_index_context()->get_inverted_index_result_for_expr(
+                                child.get());
+                roaring::Roaring full_result;
+                full_result.addRange(0, segment_num_rows);
+                res = index_result->op_not(&full_result);
+            } else {
+                all_pass = false;
+            }
+            break;
+        }
+        default:
+            return Status::NotSupported(
+                    "Compound operator must be AND, OR, or NOT to execute with inverted index.");
+        }
+
+        if (all_pass && !res.is_empty()) {
+            // set fast_execute when expr evaluated by inverted index correctly
+            _can_fast_execute = true;
+            context->get_inverted_index_context()->set_inverted_index_result_for_expr(this, res);
+        }
+        return Status::OK();
+    }
+
     Status execute(VExprContext* context, Block* block, int* result_column_id) override {
-        if (children().size() == 1 || !_all_child_is_compound_and_not_const()) {
+        if (_can_fast_execute && fast_execute(context, block, result_column_id)) {
+            return Status::OK();
+        }
+        if (get_num_children() == 1 || !_all_child_is_compound_and_not_const()) {
             return VectorizedFnCall::execute(context, block, result_column_id);
         }
 
@@ -67,7 +171,7 @@ public:
         bool lhs_is_nullable = lhs_column->is_nullable();
         auto [lhs_data_column, lhs_null_map] =
                 _get_raw_data_and_null_map(lhs_column, lhs_is_nullable);
-        int filted = simd::count_zero_num((int8_t*)lhs_data_column, size);
+        size_t filted = simd::count_zero_num((int8_t*)lhs_data_column, size);
         bool lhs_all_true = (filted == 0);
         bool lhs_all_false = (filted == size);
 
@@ -95,7 +199,7 @@ public:
                 auto rhs_nullable_column = _get_raw_data_and_null_map(rhs_column, rhs_is_nullable);
                 rhs_data_column = rhs_nullable_column.first;
                 rhs_null_map = rhs_nullable_column.second;
-                int filted = simd::count_zero_num((int8_t*)rhs_data_column, size);
+                size_t filted = simd::count_zero_num((int8_t*)rhs_data_column, size);
                 rhs_all_true = (filted == 0);
                 rhs_all_false = (filted == size);
                 if (rhs_is_nullable) {
@@ -239,18 +343,14 @@ private:
     }
 
     bool _all_child_is_compound_and_not_const() const {
-        for (auto child : _children) {
-            // we can make sure non const compound predicate's return column is allow modifyied locally.
-            if (child->is_constant() || !child->is_compound_predicate()) {
-                return false;
-            }
-        }
-        return true;
+        return std::ranges::all_of(_children, [](const VExprSPtr& arg) -> bool {
+            return arg->is_compound_predicate() && !arg->is_constant();
+        });
     }
 
     std::pair<uint8*, uint8*> _get_raw_data_and_null_map(ColumnPtr column,
-                                                         bool nullable_column) const {
-        if (nullable_column) {
+                                                         bool has_nullable_column) const {
+        if (has_nullable_column) {
             auto* nullable_column = assert_cast<ColumnNullable*>(column->assume_mutable().get());
             auto* data_column =
                     assert_cast<ColumnUInt8*>(nullable_column->get_nested_column_ptr().get())
@@ -270,4 +370,6 @@ private:
 
     TExprOpcode::type _op;
 };
+
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

@@ -73,10 +73,14 @@ public class NestedLoopJoinNode extends JoinNodeBase {
         tupleIds.addAll(inner.getOutputTupleIds());
     }
 
-    public boolean canParallelize() {
+    public static boolean canParallelize(JoinOperator joinOp) {
         return joinOp == JoinOperator.CROSS_JOIN || joinOp == JoinOperator.INNER_JOIN
                 || joinOp == JoinOperator.LEFT_OUTER_JOIN || joinOp == JoinOperator.LEFT_SEMI_JOIN
                 || joinOp == JoinOperator.LEFT_ANTI_JOIN || joinOp == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN;
+    }
+
+    public boolean canParallelize() {
+        return canParallelize(joinOp);
     }
 
     public void setJoinConjuncts(List<Expr> joinConjuncts) {
@@ -276,5 +280,20 @@ public class NestedLoopJoinNode extends JoinNodeBase {
             output.append(detailPrefix).append("isMarkJoin: ").append(isMarkJoin()).append("\n");
         }
         return output.toString();
+    }
+
+    /**
+     * If joinOp is one of type below:
+     * 1. RIGHT_OUTER_JOIN
+     * 2. RIGHT_ANTI_JOIN
+     * 3. RIGHT_SEMI_JOIN
+     * 4. FULL_OUTER_JOIN
+     *
+     * Probe-side must have full data so join is a serial operator.
+     */
+    @Override
+    public boolean isSerialOperator() {
+        return joinOp == JoinOperator.RIGHT_OUTER_JOIN || joinOp == JoinOperator.RIGHT_ANTI_JOIN
+                || joinOp == JoinOperator.RIGHT_SEMI_JOIN || joinOp == JoinOperator.FULL_OUTER_JOIN;
     }
 }

@@ -35,14 +35,14 @@ suite("alter_ttl_1") {
     assertEquals(backendIdToBackendIP.size(), 1)
 
     backendId = backendIdToBackendIP.keySet()[0]
-    def url = backendIdToBackendIP.get(backendId) + ":" + backendIdToBackendHttpPort.get(backendId) + """/api/clear_file_cache"""
+    def url = backendIdToBackendIP.get(backendId) + ":" + backendIdToBackendHttpPort.get(backendId) + """/api/file_cache?op=clear&sync=true"""
     logger.info(url)
     def clearFileCache = { check_func ->
         httpTest {
             endpoint ""
             uri url
-            op "post"
-            body "{\"sync\"=\"true\"}"
+            op "get"
+            body ""
             check check_func
         }
     }
@@ -61,7 +61,8 @@ suite("alter_ttl_1") {
         |"AWS_ACCESS_KEY" = "${getS3AK()}",
         |"AWS_SECRET_KEY" = "${getS3SK()}",
         |"AWS_ENDPOINT" = "${getS3Endpoint()}",
-        |"AWS_REGION" = "${getS3Region()}")
+        |"AWS_REGION" = "${getS3Region()}",
+        |"provider" = "${getS3Provider()}")
         |PROPERTIES(
         |"exec_mem_limit" = "8589934592",
         |"load_parallelism" = "3")""".stripMargin()
@@ -97,6 +98,7 @@ suite("alter_ttl_1") {
     }
 
     load_customer_ttl_once("customer_ttl")
+    sql """ select count(*) from customer_ttl """
     sleep(30000)
     long ttl_cache_size = 0
     getMetricsMethod.call() {
@@ -118,7 +120,7 @@ suite("alter_ttl_1") {
             }
             assertTrue(flag1)
     }
-    sql """ ALTER TABLE customer_ttl SET ("file_cache_ttl_seconds"="120") """
+    sql """ ALTER TABLE customer_ttl SET ("file_cache_ttl_seconds"="140") """
     sleep(80000)
     getMetricsMethod.call() {
         respCode, body ->
@@ -140,7 +142,7 @@ suite("alter_ttl_1") {
             assertTrue(flag1)
     }
     // wait for ttl timeout
-    sleep(30000)
+    sleep(50000)
     getMetricsMethod.call() {
         respCode, body ->
             assertEquals("${respCode}".toString(), "200")

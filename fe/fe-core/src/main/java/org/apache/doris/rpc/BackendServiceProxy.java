@@ -19,10 +19,12 @@ package org.apache.doris.rpc;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.Status;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.metric.MetricRepo;
-import org.apache.doris.planner.PlanFragmentId;
 import org.apache.doris.proto.InternalService;
+import org.apache.doris.proto.InternalService.PAlterVaultSyncRequest;
+import org.apache.doris.proto.InternalService.PAlterVaultSyncResponse;
 import org.apache.doris.proto.InternalService.PExecPlanFragmentStartRequest;
 import org.apache.doris.proto.InternalService.PGetWalQueueSizeRequest;
 import org.apache.doris.proto.InternalService.PGetWalQueueSizeResponse;
@@ -199,7 +201,23 @@ public class BackendServiceProxy {
         // VERSION 3 means we send TPipelineFragmentParamsList
         builder.setVersion(InternalService.PFragmentRequestVersion.VERSION_3);
 
-        final InternalService.PExecPlanFragmentRequest pRequest = builder.build();
+        return execPlanFragmentsAsync(address, builder.build(), twoPhaseExecution);
+    }
+
+    public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentsAsync(TNetworkAddress address,
+            ByteString serializedFragments, boolean twoPhaseExecution) throws RpcException {
+        InternalService.PExecPlanFragmentRequest.Builder builder =
+                InternalService.PExecPlanFragmentRequest.newBuilder();
+        builder.setRequest(serializedFragments);
+        builder.setCompact(true);
+        // VERSION 3 means we send TPipelineFragmentParamsList
+        builder.setVersion(InternalService.PFragmentRequestVersion.VERSION_3);
+        return execPlanFragmentsAsync(address, builder.build(), twoPhaseExecution);
+    }
+
+    public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentsAsync(TNetworkAddress address,
+            InternalService.PExecPlanFragmentRequest pRequest, boolean twoPhaseExecution)
+            throws RpcException {
         MetricRepo.BE_COUNTER_QUERY_RPC_ALL.getOrAdd(address.hostname).increase(1L);
         MetricRepo.BE_COUNTER_QUERY_RPC_SIZE.getOrAdd(address.hostname).increase((long) pRequest.getSerializedSize());
         try {
@@ -217,7 +235,7 @@ public class BackendServiceProxy {
     }
 
     public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentStartAsync(TNetworkAddress address,
-            PExecPlanFragmentStartRequest request) throws TException, RpcException {
+            PExecPlanFragmentStartRequest request) throws RpcException {
         try {
             final BackendServiceClient client = getProxy(address);
             return client.execPlanFragmentStartAsync(request);
@@ -227,11 +245,13 @@ public class BackendServiceProxy {
     }
 
     public ListenableFuture<InternalService.PCancelPlanFragmentResult> cancelPlanFragmentAsync(TNetworkAddress address,
-            TUniqueId finstId, Types.PPlanFragmentCancelReason cancelReason) throws RpcException {
+            Status cancelReason) throws RpcException {
         final InternalService.PCancelPlanFragmentRequest pRequest =
                 InternalService.PCancelPlanFragmentRequest.newBuilder()
-                        .setFinstId(Types.PUniqueId.newBuilder().setHi(finstId.hi).setLo(finstId.lo).build())
-                        .setCancelReason(cancelReason).build();
+                        // instance id is not used, but it is a required field.
+                        .setFinstId(Types.PUniqueId.newBuilder().setHi(0).setLo(0).build())
+                        .setCancelReason(cancelReason.getPCancelReason())
+                        .setCancelStatus(cancelReason.toPStatus()).build();
         try {
             final BackendServiceClient client = getProxy(address);
             return client.cancelPlanFragmentAsync(pRequest);
@@ -243,13 +263,13 @@ public class BackendServiceProxy {
     }
 
     public ListenableFuture<InternalService.PCancelPlanFragmentResult> cancelPipelineXPlanFragmentAsync(
-            TNetworkAddress address, PlanFragmentId fragmentId, TUniqueId queryId,
-            Types.PPlanFragmentCancelReason cancelReason) throws RpcException {
+            TNetworkAddress address, TUniqueId queryId, Status cancelReason) throws RpcException {
         final InternalService.PCancelPlanFragmentRequest pRequest = InternalService.PCancelPlanFragmentRequest
                 .newBuilder()
+                // instance id is not used, but it is a required field.
                 .setFinstId(Types.PUniqueId.newBuilder().setHi(0).setLo(0).build())
-                .setCancelReason(cancelReason)
-                .setFragmentId(fragmentId.asInt())
+                .setCancelReason(cancelReason.getPCancelReason())
+                .setCancelStatus(cancelReason.toPStatus())
                 .setQueryId(Types.PUniqueId.newBuilder().setHi(queryId.hi).setLo(queryId.lo).build()).build();
         try {
             final BackendServiceClient client = getProxy(address);
@@ -304,6 +324,18 @@ public class BackendServiceProxy {
             return client.fetchArrowFlightSchema(request);
         } catch (Throwable e) {
             LOG.warn("fetch arrow flight schema catch a exception, address={}:{}",
+                    address.getHostname(), address.getPort(), e);
+            throw new RpcException(address.hostname, e.getMessage());
+        }
+    }
+
+    public Future<InternalService.POutfileWriteSuccessResult> outfileWriteSuccessAsync(TNetworkAddress address,
+            InternalService.POutfileWriteSuccessRequest request)  throws RpcException {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.outfileWriteSuccessAsync(request);
+        } catch (Throwable e) {
+            LOG.warn("outfile write success file catch a exception, address={}:{}",
                     address.getHostname(), address.getPort(), e);
             throw new RpcException(address.hostname, e.getMessage());
         }
@@ -499,6 +531,18 @@ public class BackendServiceProxy {
         }
     }
 
+    public Future<PAlterVaultSyncResponse> alterVaultSync(TNetworkAddress address,
+            PAlterVaultSyncRequest request) throws RpcException {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.alterVaultSync(request);
+        } catch (Throwable e) {
+            LOG.warn("failed to alter vault sync from address={}:{}", address.getHostname(),
+                    address.getPort(), e);
+            throw new RpcException(address.getHostname(), e.getMessage());
+        }
+    }
+
     public Future<InternalService.PFetchRemoteSchemaResponse> fetchRemoteTabletSchemaAsync(
             TNetworkAddress address, InternalService.PFetchRemoteSchemaRequest request) throws RpcException {
         try {
@@ -511,5 +555,16 @@ public class BackendServiceProxy {
         }
     }
 
+    public Future<InternalService.PGetBeResourceResponse> getBeResourceAsync(TNetworkAddress address, int timeoutSec,
+            InternalService.PGetBeResourceRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.getBeResource(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("get be resource failed, address={}:{}",
+                    address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
 
 }

@@ -24,12 +24,8 @@ import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 
-import com.google.common.collect.Maps;
-
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -39,35 +35,12 @@ public interface MTMVRelatedTableIf extends TableIf {
 
     /**
      * Get all partitions of the table
+     * Note: This method is called every time there is a refresh and transparent rewrite,
+     * so if this method is slow, it will significantly reduce query performance
      *
-     * @return partitionId->PartitionItem
+     * @return partitionName->PartitionItem
      */
-    Map<Long, PartitionItem> getAndCopyPartitionItems();
-
-    /**
-     * Obtain a list of partitions filtered by time
-     *
-     * @param pos The position of the partition column to be checked in all partition columns
-     * @param config
-     * @return
-     * @throws AnalysisException
-     */
-    default Map<Long, PartitionItem> getPartitionItemsByTimeFilter(int pos, MTMVPartitionSyncConfig config)
-            throws AnalysisException {
-        Map<Long, PartitionItem> partitionItems = getAndCopyPartitionItems();
-        if (config.getSyncLimit() <= 0) {
-            return partitionItems;
-        }
-        long nowTruncSubSec = MTMVUtil.getNowTruncSubSec(config.getTimeUnit(), config.getSyncLimit());
-        Optional<String> dateFormat = config.getDateFormat();
-        Map<Long, PartitionItem> res = Maps.newHashMap();
-        for (Entry<Long, PartitionItem> entry : partitionItems.entrySet()) {
-            if (entry.getValue().isGreaterThanSpecifiedTime(pos, dateFormat, nowTruncSubSec)) {
-                res.put(entry.getKey(), entry.getValue());
-            }
-        }
-        return res;
-    }
+    Map<String, PartitionItem> getAndCopyPartitionItems() throws AnalysisException;
 
     /**
      * getPartitionType LIST/RANGE/UNPARTITIONED
@@ -93,29 +66,28 @@ public interface MTMVRelatedTableIf extends TableIf {
 
     /**
      * getPartitionSnapshot
+     * It is best to use the version. If there is no version, use the last update time
+     * If snapshots have already been obtained in bulk in the context,
+     * the results should be obtained directly from the context
      *
-     * @param partitionId
+     * @param partitionName
+     * @param context
      * @return partition snapshot at current time
      * @throws AnalysisException
      */
-    MTMVSnapshotIf getPartitionSnapshot(long partitionId) throws AnalysisException;
+    MTMVSnapshotIf getPartitionSnapshot(String partitionName, MTMVRefreshContext context) throws AnalysisException;
 
     /**
      * getTableSnapshot
+     * It is best to use the version. If there is no version, use the last update time
+     * If snapshots have already been obtained in bulk in the context,
+     * the results should be obtained directly from the context
      *
+     * @param context
      * @return table snapshot at current time
      * @throws AnalysisException
      */
-    MTMVSnapshotIf getTableSnapshot() throws AnalysisException;
-
-    /**
-     * getPartitionName
-     *
-     * @param partitionId
-     * @return partitionName
-     * @throws AnalysisException
-     */
-    String getPartitionName(long partitionId) throws AnalysisException;
+    MTMVSnapshotIf getTableSnapshot(MTMVRefreshContext context) throws AnalysisException;
 
     /**
      * Does the current type of table allow timed triggering
@@ -123,7 +95,9 @@ public interface MTMVRelatedTableIf extends TableIf {
      * @return If return false,The method of comparing whether to synchronize will directly return true,
      *         otherwise the snapshot information will be compared
      */
-    boolean needAutoRefresh();
+    default boolean needAutoRefresh() {
+        return true;
+    }
 
     /**
      * if allow partition column `isAllowNull`

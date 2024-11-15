@@ -20,6 +20,7 @@ package org.apache.doris.nereids.rules.rewrite.mv;
 import org.apache.doris.analysis.CreateMaterializedViewStmt;
 import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
@@ -56,6 +57,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanVisitor;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.PlanUtils;
 import org.apache.doris.planner.PlanNode;
 
 import com.google.common.collect.ImmutableList;
@@ -63,7 +65,6 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Lists;
-import org.apache.commons.collections.CollectionUtils;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -87,17 +88,7 @@ public abstract class AbstractSelectMaterializedIndexRule {
             case AGG_KEYS:
             case UNIQUE_KEYS:
             case DUP_KEYS:
-                // SelectMaterializedIndexWithAggregate(R1) run before SelectMaterializedIndexWithoutAggregate(R2)
-                // if R1 selects baseIndex and preAggStatus is off
-                // we should give a chance to R2 to check if some prefix-index can be selected
-                // so if R1 selects baseIndex and preAggStatus is off, we keep scan's index unselected in order to
-                // let R2 to get a chance to do its work
-                // at last, after R1, the scan may be the 4 status
-                // 1. preAggStatus is ON and baseIndex is selected, it means select baseIndex is correct.
-                // 2. preAggStatus is ON and some other Index is selected, this is correct, too.
-                // 3. preAggStatus is OFF, no index is selected, it means R2 could get a chance to run
-                // so we check the preAggStatus and if some index is selected to make sure R1 can be run only once
-                return scan.getPreAggStatus().isOn() && !scan.isIndexSelected();
+                return !scan.isIndexSelected();
             default:
                 return false;
         }
@@ -241,10 +232,14 @@ public abstract class AbstractSelectMaterializedIndexRule {
     protected static long selectBestIndex(
             List<MaterializedIndex> candidates,
             LogicalOlapScan scan,
-            Set<Expression> predicates) {
+            Set<Expression> predicates,
+            Set<? extends Expression> requiredExprs) {
         if (candidates.isEmpty()) {
             return scan.getTable().getBaseIndexId();
         }
+
+        MaterializedIndex baseIndex = scan.getTable().getBaseIndex();
+        candidates.add(baseIndex);
 
         OlapTable table = scan.getTable();
         // Scan slot exprId -> slot name
@@ -253,11 +248,20 @@ public abstract class AbstractSelectMaterializedIndexRule {
                 .collect(Collectors.toMap(NamedExpression::getExprId, NamedExpression::getName));
 
         // find matching key prefix most.
-        List<MaterializedIndex> matchingKeyPrefixMost = matchPrefixMost(scan, candidates, predicates, exprIdToName);
+        candidates = matchPrefixMost(scan, candidates, predicates, exprIdToName);
+        if (candidates.size() > 1) {
+            Set<String> requiredExprNames = requiredExprs.stream().map(e -> {
+                if (e instanceof Alias) {
+                    return ((Alias) e).child().toSql().toLowerCase();
+                }
+                return e.toSql().toLowerCase();
+            }).collect(Collectors.toSet());
+            candidates = matchColumnMost(scan.getTable(), candidates, requiredExprNames);
+        }
 
         List<Long> partitionIds = scan.getSelectedPartitionIds();
         // sort by row count, column count and index id.
-        List<Long> sortedIndexIds = matchingKeyPrefixMost.stream()
+        List<Long> sortedIndexIds = candidates.stream()
                 .map(MaterializedIndex::getId)
                 .sorted(Comparator
                         // compare by row count
@@ -266,11 +270,13 @@ public abstract class AbstractSelectMaterializedIndexRule {
                                 .sum())
                         // compare by column count
                         .thenComparing(rid -> table.getSchemaByIndexId((Long) rid).size())
+                        // prioritize using non-base index
+                        .thenComparing(rid -> (Long) rid == baseIndex.getId())
                         // compare by index id
                         .thenComparing(rid -> (Long) rid))
                 .collect(Collectors.toList());
 
-        return CollectionUtils.isEmpty(sortedIndexIds) ? scan.getTable().getBaseIndexId() : sortedIndexIds.get(0);
+        return table.getBestMvIdWithHint(sortedIndexIds);
     }
 
     protected static List<MaterializedIndex> matchPrefixMost(
@@ -283,6 +289,22 @@ public abstract class AbstractSelectMaterializedIndexRule {
                 .map(String::toLowerCase).collect(Collectors.toSet());
         Set<String> nonEqualColNames = split.getOrDefault(false, ImmutableSet.of()).stream()
                 .map(String::toLowerCase).collect(Collectors.toSet());
+
+        // prioritize using index with where clause
+        if (candidate.stream()
+                .anyMatch(index -> scan.getTable().getIndexMetaByIndexId(index.getId()).getWhereClause() != null)) {
+            candidate = candidate.stream()
+                    .filter(index -> scan.getTable().getIndexMetaByIndexId(index.getId()).getWhereClause() != null)
+                    .collect(Collectors.toList());
+        }
+
+        // prioritize using index with pre agg
+        if (candidate.stream().anyMatch(
+                index -> scan.getTable().getIndexMetaByIndexId(index.getId()).getKeysType() != KeysType.DUP_KEYS)) {
+            candidate = candidate.stream().filter(
+                    index -> scan.getTable().getIndexMetaByIndexId(index.getId()).getKeysType() != KeysType.DUP_KEYS)
+                    .collect(Collectors.toList());
+        }
 
         if (!(equalColNames.isEmpty() && nonEqualColNames.isEmpty())) {
             List<MaterializedIndex> matchingResult = matchKeyPrefixMost(scan.getTable(), candidate,
@@ -433,6 +455,33 @@ public abstract class AbstractSelectMaterializedIndexRule {
         return matchCount;
     }
 
+    private static List<MaterializedIndex> matchColumnMost(
+            OlapTable table,
+            List<MaterializedIndex> indexes,
+            Set<String> requiredExprs) {
+        TreeMap<Integer, List<MaterializedIndex>> collect = indexes.stream()
+                .collect(Collectors.toMap(
+                        index -> columnMatchCount(table, index, requiredExprs),
+                        Lists::newArrayList,
+                        (l1, l2) -> {
+                            l1.addAll(l2);
+                            return l1;
+                        },
+                        TreeMap::new)
+                );
+        return collect.descendingMap().firstEntry().getValue();
+    }
+
+    private static int columnMatchCount(OlapTable table, MaterializedIndex index, Set<String> requiredColNames) {
+        int matchCount = 0;
+        for (Column column : table.getSchemaByIndexId(index.getId())) {
+            if (requiredColNames.contains(normalizeName(column.getNameWithoutMvPrefix().toLowerCase()))) {
+                matchCount++;
+            }
+        }
+        return matchCount;
+    }
+
     protected static boolean preAggEnabledByHint(LogicalOlapScan olapScan) {
         for (String hint : olapScan.getHints()) {
             if ("PREAGGOPEN".equalsIgnoreCase(hint)) {
@@ -559,20 +608,20 @@ public abstract class AbstractSelectMaterializedIndexRule {
         public LogicalRepeat<Plan> visitLogicalRepeat(LogicalRepeat<? extends Plan> repeat, Void ctx) {
             Plan child = repeat.child(0).accept(this, ctx);
             List<List<Expression>> groupingSets = repeat.getGroupingSets();
-            ImmutableList.Builder<List<Expression>> newGroupingExprs = ImmutableList.builder();
+            List<List<Expression>> newGroupingExprs = Lists.newArrayList();
             for (List<Expression> expressions : groupingSets) {
-                newGroupingExprs.add(expressions.stream()
-                        .map(expr -> new ReplaceExpressionWithMvColumn(slotContext).replace(expr))
-                        .collect(ImmutableList.toImmutableList())
-                );
+                newGroupingExprs.add(
+                        expressions.stream().map(expr -> new ReplaceExpressionWithMvColumn(slotContext).replace(expr))
+                                .collect(ImmutableList.toImmutableList()));
             }
 
             List<NamedExpression> outputExpressions = repeat.getOutputExpressions();
-            List<NamedExpression> newOutputExpressions = outputExpressions.stream()
-                    .map(expr -> (NamedExpression) new ReplaceExpressionWithMvColumn(slotContext).replace(expr))
-                    .collect(ImmutableList.toImmutableList());
+            List<NamedExpression> newOutputExpressions = PlanUtils.adjustNullableForRepeat(newGroupingExprs,
+                    outputExpressions.stream()
+                            .map(expr -> (NamedExpression) new ReplaceExpressionWithMvColumn(slotContext).replace(expr))
+                            .collect(ImmutableList.toImmutableList()));
 
-            return repeat.withNormalizedExpr(newGroupingExprs.build(), newOutputExpressions, child);
+            return repeat.withNormalizedExpr(newGroupingExprs, newOutputExpressions, child);
         }
 
         @Override

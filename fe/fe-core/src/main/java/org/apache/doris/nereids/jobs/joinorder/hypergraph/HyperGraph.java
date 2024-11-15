@@ -356,10 +356,6 @@ public class HyperGraph {
             return new HyperGraph(finalOutputs, joinEdges, nodes, filterEdges, complexProject);
         }
 
-        public List<HyperGraph> buildAll() {
-            return ImmutableList.of(build());
-        }
-
         public void updateNode(int idx, Group group) {
             Preconditions.checkArgument(nodes.get(idx) instanceof DPhyperNode);
             nodes.set(idx, ((DPhyperNode) nodes.get(idx)).withGroup(group));
@@ -429,7 +425,7 @@ public class HyperGraph {
                 LogicalFilter<?> filter = (LogicalFilter<?>) plan;
                 Pair<BitSet, Long> child = this.buildForMv(filter.child());
                 this.addFilter(filter, child);
-                return Pair.of(new BitSet(), child.second);
+                return Pair.of(child.first, child.second);
             }
 
             // process Other Node

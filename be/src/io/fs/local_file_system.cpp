@@ -33,7 +33,7 @@
 #include <utility>
 
 #include "common/exception.h"
-#include "common/sync_point.h"
+#include "cpp/sync_point.h"
 #include "gutil/macros.h"
 #include "io/fs/err_utils.h"
 #include "io/fs/file_system.h"
@@ -62,9 +62,13 @@ Status LocalFileSystem::create_file_impl(const Path& file, FileWriterPtr* writer
     int fd = ::open(file.c_str(), O_TRUNC | O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
     DBUG_EXECUTE_IF("LocalFileSystem.create_file_impl.open_file_failed", {
         // spare '.testfile' to make bad disk checker happy
-        if (file.filename().compare(kTestFilePath)) {
+        auto sub_path = dp->param<std::string>("sub_path", "");
+        if ((sub_path.empty() && file.filename().compare(kTestFilePath)) ||
+            (!sub_path.empty() && file.native().find(sub_path) != std::string::npos)) {
             ::close(fd);
             fd = -1;
+            errno = EIO;
+            LOG(WARNING) << Status::IOError("debug open io error: {}", file.native());
         }
     });
     if (-1 == fd) {
@@ -85,6 +89,17 @@ Status LocalFileSystem::open_file_impl(const Path& file, FileReaderSPtr* reader,
     }
     int fd = -1;
     RETRY_ON_EINTR(fd, open(file.c_str(), O_RDONLY));
+    DBUG_EXECUTE_IF("LocalFileSystem.create_file_impl.open_file_failed", {
+        // spare '.testfile' to make bad disk checker happy
+        auto sub_path = dp->param<std::string>("sub_path", "");
+        if ((sub_path.empty() && file.filename().compare(kTestFilePath)) ||
+            (!sub_path.empty() && file.native().find(sub_path) != std::string::npos)) {
+            ::close(fd);
+            fd = -1;
+            errno = EIO;
+            LOG(WARNING) << Status::IOError("debug open io error: {}", file.native());
+        }
+    });
     if (fd < 0) {
         return localfs_error(errno, fmt::format("failed to open {}", file.native()));
     }
@@ -93,17 +108,17 @@ Status LocalFileSystem::open_file_impl(const Path& file, FileReaderSPtr* reader,
 }
 
 Status LocalFileSystem::create_directory_impl(const Path& dir, bool failed_if_exists) {
-    if (failed_if_exists) {
-        bool exists = true;
-        RETURN_IF_ERROR(exists_impl(dir, &exists));
-        if (exists) {
-            return Status::AlreadyExist("failed to create {}, already exists", dir.native());
-        }
+    bool exists = true;
+    RETURN_IF_ERROR(exists_impl(dir, &exists));
+    if (exists && failed_if_exists) {
+        return Status::AlreadyExist("failed to create {}, already exists", dir.native());
     }
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        return localfs_error(ec, fmt::format("failed to create {}", dir.native()));
+    if (!exists) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            return localfs_error(ec, fmt::format("failed to create {}", dir.native()));
+        }
     }
     return Status::OK();
 }

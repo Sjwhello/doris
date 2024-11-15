@@ -17,6 +17,9 @@
 
 #pragma once
 
+#if defined(USE_LIBCPP) && _LIBCPP_ABI_VERSION <= 1
+#define _LIBCPP_ABI_INCOMPLETE_TYPES_IN_DEQUE
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -24,11 +27,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "recycler/s3_accessor.h"
+#include "recycler/storage_vault_accessor.h"
 #include "recycler/white_black_list.h"
 
 namespace doris::cloud {
-class ObjStoreAccessor;
+class StorageVaultAccessor;
 class InstanceChecker;
 class TxnKv;
 class InstanceInfoPB;
@@ -74,13 +77,14 @@ public:
     explicit InstanceChecker(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id);
     // Return 0 if success, otherwise error
     int init(const InstanceInfoPB& instance);
-    // Check whether the objects in the object store of the instance belong to the visible rowsets.
-    // This function is used to verify that there is no garbage data leakage, should only be called in recycler test.
-    // Return 0 if success, otherwise failed
+    // Return 0 if success.
+    // Return 1 if data leak is identified.
+    // Return negative if a temporary error occurred during the check process.
     int do_inverted_check();
-    // Return 0 if success, the definition of success is the absence of S3 access errors and data loss
-    // Return -1 if encountering the situation that need to abort checker.
-    // Return -2 if having S3 access errors or data loss
+
+    // Return 0 if success.
+    // Return 1 if data loss is identified.
+    // Return negative if a temporary error occurred during the check process.
     int do_check();
     // If there are multiple buckets, return the minimum lifecycle; if there are no buckets (i.e.
     // all accessors are HdfsAccessor), return INT64_MAX.
@@ -100,7 +104,7 @@ private:
     std::shared_ptr<TxnKv> txn_kv_;
     std::string instance_id_;
     // id -> accessor
-    std::unordered_map<std::string, std::shared_ptr<ObjStoreAccessor>> accessor_map_;
+    std::unordered_map<std::string, std::shared_ptr<StorageVaultAccessor>> accessor_map_;
 };
 
 } // namespace doris::cloud

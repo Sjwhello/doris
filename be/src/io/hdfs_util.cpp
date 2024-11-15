@@ -17,19 +17,23 @@
 
 #include "io/hdfs_util.h"
 
+#include <bthread/bthread.h>
+#include <bthread/butex.h>
+#include <bvar/latency_recorder.h>
 #include <gen_cpp/cloud.pb.h>
 
 #include <ostream>
+#include <thread>
 
 #include "common/logging.h"
-#include "gutil/hash/hash.h"
 #include "io/fs/err_utils.h"
 #include "io/hdfs_builder.h"
+#include "vec/common/string_ref.h"
 
 namespace doris::io {
 namespace {
 
-Status create_hdfs_fs(const THdfsParams& hdfs_params, const std::string& fs_name, hdfsFS* fs) {
+Status _create_hdfs_fs(const THdfsParams& hdfs_params, const std::string& fs_name, hdfsFS* fs) {
     HDFSCommonBuilder builder;
     RETURN_IF_ERROR(create_hdfs_builder(hdfs_params, fs_name, &builder));
     hdfsFS hdfs_fs = hdfsBuilderConnect(builder.get());
@@ -40,17 +44,57 @@ Status create_hdfs_fs(const THdfsParams& hdfs_params, const std::string& fs_name
     return Status::OK();
 }
 
-uint64 hdfs_hash_code(const THdfsParams& hdfs_params) {
-    uint64 hash_code = 0;
-    hash_code ^= Fingerprint(hdfs_params.fs_name);
+// https://brpc.apache.org/docs/server/basics/
+// According to the brpc doc, JNI code checks stack layout and cannot be run in
+// bthreads so create a pthread for creating hdfs connection if necessary.
+Status create_hdfs_fs(const THdfsParams& hdfs_params, const std::string& fs_name, hdfsFS* fs) {
+    bool is_pthread = bthread_self() == 0;
+    LOG(INFO) << "create hfdfs fs, is_pthread=" << is_pthread << " fs_name=" << fs_name;
+    if (is_pthread) { // running in pthread
+        return _create_hdfs_fs(hdfs_params, fs_name, fs);
+    }
+
+    // running in bthread, switch to a pthread and wait
+    Status st;
+    auto btx = bthread::butex_create();
+    *(int*)btx = 0;
+    std::thread t([&] {
+        st = _create_hdfs_fs(hdfs_params, fs_name, fs);
+        *(int*)btx = 1;
+        bthread::butex_wake_all(btx);
+    });
+    std::unique_ptr<int, std::function<void(int*)>> defer((int*)0x01, [&t, &btx](...) {
+        if (t.joinable()) t.join();
+        bthread::butex_destroy(btx);
+    });
+    timespec tmout {.tv_sec = std::chrono::system_clock::now().time_since_epoch().count() + 60,
+                    .tv_nsec = 0};
+    if (int ret = bthread::butex_wait(btx, 1, &tmout); ret != 0) {
+        std::string msg = "failed to wait _create_hdfs_fs fs_name=" + fs_name;
+        LOG(WARNING) << msg << " error=" << std::strerror(errno);
+        st = Status::Error<ErrorCode::INTERNAL_ERROR, false>(msg);
+    }
+    return st;
+}
+
+uint64_t hdfs_hash_code(const THdfsParams& hdfs_params, const std::string& fs_name) {
+    uint64_t hash_code = 0;
+    // The specified fsname is used first.
+    // If there is no specified fsname, the default fsname is used
+    if (!fs_name.empty()) {
+        hash_code ^= crc32_hash(fs_name);
+    } else if (hdfs_params.__isset.fs_name) {
+        hash_code ^= crc32_hash(hdfs_params.fs_name);
+    }
+
     if (hdfs_params.__isset.user) {
-        hash_code ^= Fingerprint(hdfs_params.user);
+        hash_code ^= crc32_hash(hdfs_params.user);
     }
     if (hdfs_params.__isset.hdfs_kerberos_principal) {
-        hash_code ^= Fingerprint(hdfs_params.hdfs_kerberos_principal);
+        hash_code ^= crc32_hash(hdfs_params.hdfs_kerberos_principal);
     }
     if (hdfs_params.__isset.hdfs_kerberos_keytab) {
-        hash_code ^= Fingerprint(hdfs_params.hdfs_kerberos_keytab);
+        hash_code ^= crc32_hash(hdfs_params.hdfs_kerberos_keytab);
     }
     if (hdfs_params.__isset.hdfs_conf) {
         std::map<std::string, std::string> conf_map;
@@ -58,8 +102,8 @@ uint64 hdfs_hash_code(const THdfsParams& hdfs_params) {
             conf_map[conf.key] = conf.value;
         }
         for (auto& conf : conf_map) {
-            hash_code ^= Fingerprint(conf.first);
-            hash_code ^= Fingerprint(conf.second);
+            hash_code ^= crc32_hash(conf.first);
+            hash_code ^= crc32_hash(conf.second);
         }
     }
     return hash_code;
@@ -67,10 +111,21 @@ uint64 hdfs_hash_code(const THdfsParams& hdfs_params) {
 
 } // namespace
 
+namespace hdfs_bvar {
+bvar::LatencyRecorder hdfs_read_latency("hdfs_read");
+bvar::LatencyRecorder hdfs_write_latency("hdfs_write");
+bvar::LatencyRecorder hdfs_create_dir_latency("hdfs_create_dir");
+bvar::LatencyRecorder hdfs_open_latency("hdfs_open");
+bvar::LatencyRecorder hdfs_close_latency("hdfs_close");
+bvar::LatencyRecorder hdfs_flush_latency("hdfs_flush");
+bvar::LatencyRecorder hdfs_hflush_latency("hdfs_hflush");
+bvar::LatencyRecorder hdfs_hsync_latency("hdfs_hsync");
+}; // namespace hdfs_bvar
+
 void HdfsHandlerCache::_clean_invalid() {
-    std::vector<uint64> removed_handle;
+    std::vector<uint64_t> removed_handle;
     for (auto& item : _cache) {
-        if (item.second->invalid() && item.second->ref_cnt() == 0) {
+        if (item.second.use_count() == 1 && item.second->invalid()) {
             removed_handle.emplace_back(item.first);
         }
     }
@@ -81,9 +136,9 @@ void HdfsHandlerCache::_clean_invalid() {
 
 void HdfsHandlerCache::_clean_oldest() {
     uint64_t oldest_time = ULONG_MAX;
-    uint64 oldest = 0;
+    uint64_t oldest = 0;
     for (auto& item : _cache) {
-        if (item.second->ref_cnt() == 0 && item.second->last_access_time() < oldest_time) {
+        if (item.second.use_count() == 1 && item.second->last_access_time() < oldest_time) {
             oldest_time = item.second->last_access_time();
             oldest = item.first;
         }
@@ -92,16 +147,16 @@ void HdfsHandlerCache::_clean_oldest() {
 }
 
 Status HdfsHandlerCache::get_connection(const THdfsParams& hdfs_params, const std::string& fs_name,
-                                        HdfsHandler** fs_handle) {
-    uint64 hash_code = hdfs_hash_code(hdfs_params);
+                                        std::shared_ptr<HdfsHandler>* fs_handle) {
+    uint64_t hash_code = hdfs_hash_code(hdfs_params, fs_name);
     {
         std::lock_guard<std::mutex> l(_lock);
         auto it = _cache.find(hash_code);
         if (it != _cache.end()) {
-            HdfsHandler* handle = it->second.get();
+            std::shared_ptr<HdfsHandler> handle = it->second;
             if (!handle->invalid()) {
-                handle->inc_ref();
-                *fs_handle = handle;
+                handle->update_last_access_time();
+                *fs_handle = std::move(handle);
                 return Status::OK();
             }
             // fs handle is invalid, erase it.
@@ -118,12 +173,12 @@ Status HdfsHandlerCache::get_connection(const THdfsParams& hdfs_params, const st
             _clean_oldest();
         }
         if (_cache.size() < MAX_CACHE_HANDLE) {
-            std::unique_ptr<HdfsHandler> handle = std::make_unique<HdfsHandler>(hdfs_fs, true);
-            handle->inc_ref();
-            *fs_handle = handle.get();
+            auto handle = std::make_shared<HdfsHandler>(hdfs_fs, true);
+            handle->update_last_access_time();
+            *fs_handle = handle;
             _cache[hash_code] = std::move(handle);
         } else {
-            *fs_handle = new HdfsHandler(hdfs_fs, false);
+            *fs_handle = std::make_shared<HdfsHandler>(hdfs_fs, false);
         }
     }
     return Status::OK();
@@ -158,10 +213,10 @@ THdfsParams to_hdfs_params(const cloud::HdfsVaultInfo& vault) {
         params.__set_user(build_conf.user());
     }
     if (build_conf.has_hdfs_kerberos_principal()) {
-        params.__set_hdfs_kerberos_keytab(build_conf.hdfs_kerberos_principal());
+        params.__set_hdfs_kerberos_principal(build_conf.hdfs_kerberos_principal());
     }
     if (build_conf.has_hdfs_kerberos_keytab()) {
-        params.__set_hdfs_kerberos_principal(build_conf.hdfs_kerberos_keytab());
+        params.__set_hdfs_kerberos_keytab(build_conf.hdfs_kerberos_keytab());
     }
     std::vector<THdfsConf> tconfs;
     for (const auto& confs : vault.build_conf().hdfs_confs()) {

@@ -80,7 +80,7 @@ Status BaseCompaction::execute_compact() {
 
     tablet()->set_last_base_compaction_success_time(UnixMillis());
     DorisMetrics::instance()->base_compaction_deltas_total->increment(_input_rowsets.size());
-    DorisMetrics::instance()->base_compaction_bytes_total->increment(_input_rowsets_size);
+    DorisMetrics::instance()->base_compaction_bytes_total->increment(_input_rowsets_total_size);
 
     return Status::OK();
 }
@@ -150,6 +150,16 @@ Status BaseCompaction::pick_rowsets_to_compact() {
                 "the tablet is with rowset: [0-1], [2-y], and [0-1] has no data. in this "
                 "situation, no need to do base compaction.");
     }
+
+    int score = 0;
+    int rowset_cnt = 0;
+    while (rowset_cnt < _input_rowsets.size()) {
+        score += _input_rowsets[rowset_cnt++]->rowset_meta()->get_compaction_score();
+        if (score > config::base_compaction_max_compaction_score) {
+            break;
+        }
+    }
+    _input_rowsets.resize(rowset_cnt);
 
     // 1. cumulative rowset must reach base_compaction_num_cumulative_deltas threshold
     if (_input_rowsets.size() > config::base_compaction_min_rowset_num) {

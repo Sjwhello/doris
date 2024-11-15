@@ -95,8 +95,9 @@ public:
         {
             TJavaUdfExecutorCtorParams ctor_params;
             ctor_params.__set_fn(fn);
-            ctor_params.__set_location(local_location);
-
+            if (!fn.hdfs_location.empty() && !fn.checksum.empty()) {
+                ctor_params.__set_location(local_location);
+            }
             jbyteArray ctor_params_bytes;
 
             // Pushed frame will be popped when jni_frame goes out-of-scope.
@@ -147,6 +148,7 @@ public:
         jbyteArray arr = env->NewByteArray(len);
         env->SetByteArrayRegion(arr, 0, len, reinterpret_cast<jbyte*>(serialize_data.data()));
         env->CallNonvirtualVoidMethod(executor_obj, executor_cl, executor_merge_id, place, arr);
+        RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
         jbyte* pBytes = env->GetByteArrayElements(arr, nullptr);
         env->ReleaseByteArrayElements(arr, pBytes, JNI_ABORT);
         env->DeleteLocalRef(arr);
@@ -274,7 +276,13 @@ public:
     //So need to check as soon as possible, before call Data function
     Status check_udaf(const TFunction& fn) {
         auto function_cache = UserFunctionCache::instance();
-        return function_cache->get_jarpath(fn.id, fn.hdfs_location, fn.checksum, &_local_location);
+        // get jar path if both file path location and checksum are null
+        if (!fn.hdfs_location.empty() && !fn.checksum.empty()) {
+            return function_cache->get_jarpath(fn.id, fn.hdfs_location, fn.checksum,
+                                               &_local_location);
+        } else {
+            return Status::OK();
+        }
     }
 
     void create(AggregateDataPtr __restrict place) const override {
@@ -325,7 +333,7 @@ public:
     }
 
     void add_batch(size_t batch_size, AggregateDataPtr* places, size_t place_offset,
-                   const IColumn** columns, Arena* /*arena*/, bool /*agg_many*/) const override {
+                   const IColumn** columns, Arena*, bool /*agg_many*/) const override {
         int64_t places_address = reinterpret_cast<int64_t>(places);
         Status st = this->data(_exec_place)
                             .add(places_address, false, columns, 0, batch_size, argument_types,
@@ -336,7 +344,7 @@ public:
     }
 
     void add_batch_single_place(size_t batch_size, AggregateDataPtr place, const IColumn** columns,
-                                Arena* /*arena*/) const override {
+                                Arena*) const override {
         int64_t places_address = reinterpret_cast<int64_t>(place);
         Status st = this->data(_exec_place)
                             .add(places_address, true, columns, 0, batch_size, argument_types, 0);
@@ -347,7 +355,7 @@ public:
 
     void add_range_single_place(int64_t partition_start, int64_t partition_end, int64_t frame_start,
                                 int64_t frame_end, AggregateDataPtr place, const IColumn** columns,
-                                Arena* arena) const override {
+                                Arena*) const override {
         frame_start = std::max<int64_t>(frame_start, partition_start);
         frame_end = std::min<int64_t>(frame_end, partition_end);
         int64_t places_address = reinterpret_cast<int64_t>(place);

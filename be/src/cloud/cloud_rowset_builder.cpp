@@ -46,6 +46,10 @@ Status CloudRowsetBuilder::init() {
     }
     RETURN_IF_ERROR(check_tablet_version_count());
 
+    using namespace std::chrono;
+    std::static_pointer_cast<CloudTablet>(_tablet)->last_load_time_ms =
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+
     // build tablet schema in request level
     _build_current_tablet_schema(_req.index_id, _req.table_schema_param.get(),
                                  *_tablet->tablet_schema());
@@ -66,12 +70,12 @@ Status CloudRowsetBuilder::init() {
     context.write_file_cache = _req.write_file_cache;
     context.partial_update_info = _partial_update_info;
     context.file_cache_ttl_sec = _tablet->ttl_seconds();
-    context.fs = _engine.get_fs_by_vault_id(_req.storage_vault_id);
-    if (context.fs == nullptr) {
+    context.storage_resource = _engine.get_storage_resource(_req.storage_vault_id);
+    if (!context.storage_resource) {
         return Status::InternalError("vault id not found, maybe not sync, vault id {}",
                                      _req.storage_vault_id);
     }
-    context.rowset_dir = _tablet->tablet_path();
+
     _rowset_writer = DORIS_TRY(_tablet->create_rowset_writer(context, false));
 
     _calc_delete_bitmap_token = _engine.calc_delete_bitmap_executor()->create_token();
@@ -88,7 +92,8 @@ Status CloudRowsetBuilder::check_tablet_version_count() {
     if (version_count > config::max_tablet_version_num) {
         return Status::Error<TOO_MANY_VERSION>(
                 "failed to init rowset builder. version count: {}, exceed limit: {}, "
-                "tablet: {}",
+                "tablet: {}. Please reduce the frequency of loading data or adjust the "
+                "max_tablet_version_num in be.conf to a larger value.",
                 version_count, config::max_tablet_version_num, _tablet->tablet_id());
     }
     return Status::OK();
@@ -101,9 +106,10 @@ void CloudRowsetBuilder::update_tablet_stats() {
     tablet->fetch_add_approximate_num_rowsets(1);
     tablet->fetch_add_approximate_num_segments(_rowset->num_segments());
     tablet->fetch_add_approximate_num_rows(_rowset->num_rows());
-    tablet->fetch_add_approximate_data_size(_rowset->data_disk_size());
+    tablet->fetch_add_approximate_data_size(_rowset->total_disk_size());
     tablet->fetch_add_approximate_cumu_num_rowsets(1);
     tablet->fetch_add_approximate_cumu_num_deltas(_rowset->num_segments());
+    tablet->write_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 CloudTablet* CloudRowsetBuilder::cloud_tablet() {

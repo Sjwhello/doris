@@ -20,17 +20,15 @@ package org.apache.doris.nereids.trees.plans.logical;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.constraint.PrimaryKeyConstraint;
 import org.apache.doris.catalog.constraint.UniqueConstraint;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.FdFactory;
 import org.apache.doris.nereids.properties.FdItem;
-import org.apache.doris.nereids.properties.FunctionalDependencies;
-import org.apache.doris.nereids.properties.FunctionalDependencies.Builder;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.TableFdItem;
 import org.apache.doris.nereids.trees.expressions.Slot;
@@ -49,7 +47,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Supplier;
 
 /**
  * abstract class catalog relation for logical relation
@@ -105,7 +102,7 @@ public abstract class LogicalCatalogRelation extends LogicalRelation implements 
     public List<Slot> computeOutput() {
         return table.getBaseSchema()
                 .stream()
-                .map(col -> SlotReference.fromColumn(table, col, qualified(), this))
+                .map(col -> SlotReference.fromColumn(table, col, qualified()))
                 .collect(ImmutableList.toImmutableList());
     }
 
@@ -128,39 +125,22 @@ public abstract class LogicalCatalogRelation extends LogicalRelation implements 
     }
 
     @Override
-    public FunctionalDependencies computeFuncDeps(Supplier<List<Slot>> outputSupplier) {
-        Builder fdBuilder = new Builder();
-        Set<Slot> outputSet = Utils.fastToImmutableSet(outputSupplier.get());
-        if (table instanceof OlapTable && ((OlapTable) table).getKeysType().isAggregationFamily()) {
-            ImmutableSet.Builder<Slot> uniqSlots = ImmutableSet.builderWithExpectedSize(outputSet.size());
-            for (Slot slot : outputSet) {
-                if (!(slot instanceof SlotReference)) {
-                    continue;
-                }
-                SlotReference slotRef = (SlotReference) slot;
-                if (slotRef.getColumn().isPresent() && slotRef.getColumn().get().isKey()) {
-                    uniqSlots.add(slot);
-                }
-            }
-            fdBuilder.addUniqueSlot(uniqSlots.build());
-        }
-
+    public void computeUnique(DataTrait.Builder builder) {
+        Set<Slot> outputSet = Utils.fastToImmutableSet(getOutputSet());
         for (PrimaryKeyConstraint c : table.getPrimaryKeyConstraints()) {
             Set<Column> columns = c.getPrimaryKeys(table);
-            fdBuilder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
+            builder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
         }
 
         for (UniqueConstraint c : table.getUniqueConstraints()) {
             Set<Column> columns = c.getUniqueKeys(table);
-            fdBuilder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
+            builder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
         }
-        fdBuilder.addFdItems(computeFdItems(outputSet));
-        return fdBuilder.build();
     }
 
     @Override
-    public ImmutableSet<FdItem> computeFdItems(Supplier<List<Slot>> outputSupplier) {
-        return computeFdItems(Utils.fastToImmutableSet(outputSupplier.get()));
+    public void computeUniform(DataTrait.Builder builder) {
+        // No uniform slot for catalog relation
     }
 
     private ImmutableSet<FdItem> computeFdItems(Set<Slot> outputSet) {
@@ -205,5 +185,15 @@ public abstract class LogicalCatalogRelation extends LogicalRelation implements 
             }
         }
         return slotSet.build();
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        // don't generate any equal pair
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        // don't generate any equal pair
     }
 }

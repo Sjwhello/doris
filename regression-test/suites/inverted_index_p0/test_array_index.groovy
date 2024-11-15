@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 suite("test_array_index1"){
     // prepare test table
 
@@ -61,6 +60,7 @@ suite("test_array_index1"){
     "enable_single_replica_compaction" = "false"
     );
     """
+    sql """ set enable_common_expr_pushdown = true """
 
     sql """ INSERT INTO `${indexTblName}`(`apply_date`, `id`, `inventors`) VALUES ('2017-01-01', '6afef581285b6608bf80d5a4e46cf839', '[\"a\", \"b\", \"c\"]'); """
     sql """ INSERT INTO `${indexTblName}`(`apply_date`, `id`, `inventors`) VALUES ('2017-01-01', 'd93d942d985a8fb7547c72dada8d332d', '[\"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\", \"k\", \"l\"]'); """
@@ -82,7 +82,9 @@ suite("test_array_index1"){
     sql """ ALTER TABLE ${indexTblName} ADD INDEX index_inverted_inventors(inventors) USING INVERTED  COMMENT ''; """
     wait_for_latest_op_on_table_finish(indexTblName, timeout)
 
-    sql """ BUILD INDEX index_inverted_inventors ON ${indexTblName}; """
+    if (!isCloudMode()) {
+        sql """ BUILD INDEX index_inverted_inventors ON ${indexTblName}; """
+    }
 }
 
 suite("test_array_index2"){
