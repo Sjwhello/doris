@@ -294,6 +294,7 @@ TxnErrorCode Transaction::get(std::string_view key, std::string* val, bool snaps
     StopWatch sw;
     auto* fut = fdb_transaction_get(txn_, (uint8_t*)key.data(), key.size(), snapshot);
 
+    g_bvar_txn_kv_get_count_total << 1;
     auto release_fut = [fut, &sw](int*) {
         fdb_future_destroy(fut);
         g_bvar_txn_kv_get << sw.elapsed_us();
@@ -350,6 +351,7 @@ TxnErrorCode Transaction::get(std::string_view begin, std::string_view end,
 
     std::unique_ptr<RangeGetIterator> ret(new RangeGetIterator(fut));
     RETURN_IF_ERROR(ret->init());
+    g_bvar_txn_kv_get_count_total << ret->size();
 
     *(iter) = std::move(ret);
 
@@ -497,6 +499,7 @@ TxnErrorCode Transaction::batch_get(std::vector<std::optional<std::string>>* res
     StopWatch sw;
     std::vector<FDBFuture*> futures;
     futures.reserve(keys.size());
+    g_bvar_txn_kv_get_count_total << keys.size();
     for (const auto& k : keys) {
         futures.push_back(fdb_transaction_get(txn_, (uint8_t*)k.data(), k.size(), opts.snapshot));
     }

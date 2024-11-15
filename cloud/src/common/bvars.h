@@ -188,6 +188,7 @@ extern bvar::LatencyRecorder g_bvar_txn_kv_batch_get;
 
 extern bvar::Adder<int64_t> g_bvar_txn_kv_commit_error_counter;
 extern bvar::Adder<int64_t> g_bvar_txn_kv_commit_conflict_counter;
+extern bvar::Adder<int64_t> g_bvar_txn_kv_get_count_total;
 
 extern const int64_t BVAR_FDB_INVALID_VALUE;
 extern bvar::Status<int64_t> g_bvar_fdb_client_count;
