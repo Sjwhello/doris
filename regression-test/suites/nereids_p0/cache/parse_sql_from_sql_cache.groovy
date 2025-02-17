@@ -995,7 +995,7 @@ suite("parse_sql_from_sql_cache") {
                 assertTrue(result1.size() == 2)
                 assertHasCache "select * from test_use_plan_cache26"
 
-                sql "alter table test_use_plan_cache25 modify column c1 int sum after c2"
+                sql "alter table test_use_plan_cache26 modify column c1 int sum after c2"
                 assertNoCache "select * from test_use_plan_cache26"
             }),
             extraThread("test_rename_column_name", {
