@@ -70,7 +70,8 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.commons.collections.CollectionUtils;
-import org.slf4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
@@ -87,7 +88,7 @@ import java.util.Set;
  * NereidsSqlCacheManager
  */
 public class NereidsSqlCacheManager {
-    protected static final Logger LOG = LoggerFactory.getLogger(NereidsSqlCacheManager.class);
+    private static final Logger LOG = LogManager.getLogger(NereidsSqlCacheManager.class);
     // key: <ctl.db>:<user>:<sql>
     // value: SqlCacheContext
     private volatile Cache<String, SqlCacheContext> sqlCaches;
