@@ -70,6 +70,8 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.commons.collections.CollectionUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.time.Duration;
@@ -85,6 +87,7 @@ import java.util.Set;
  * NereidsSqlCacheManager
  */
 public class NereidsSqlCacheManager {
+    protected static final Logger LOG = LoggerFactory.getLogger(NereidsSqlCacheManager.class);
     // key: <ctl.db>:<user>:<sql>
     // value: SqlCacheContext
     private volatile Cache<String, SqlCacheContext> sqlCaches;
@@ -241,6 +244,8 @@ public class NereidsSqlCacheManager {
             return invalidateCache(key);
         }
         if (tablesOrDataChanged(env, sqlCacheContext)) {
+            LOG.info("[sjw] TablesOrDataChanged, queryId: {}, sql cache invalidate.",
+                DebugUtil.printId(sqlCacheContext.getQueryId()));
             return invalidateCache(key);
         }
         if (viewsChanged(env, sqlCacheContext)) {
@@ -338,12 +343,20 @@ public class NereidsSqlCacheManager {
             OlapTable olapTable = (OlapTable) tableIf;
             List<Column> currentFullSchema = olapTable.getFullSchema();
             List<SqlCacheContext.ColumnSection> cacheFullSchema = tableVersion.getColumns();
+            LOG.info("[sjw] TablesOrDataChanged, queryId: {}, currentFullSchema size: {}, cacheFullSchema size: {}",
+                DebugUtil.printId(sqlCacheContext.getQueryId()), currentFullSchema.size(), cacheFullSchema.size());
             if (currentFullSchema.size() != cacheFullSchema.size()) {
                 return true;
             }
             for (int i = 0; i < currentFullSchema.size(); i++) {
                 Column currentColumn = currentFullSchema.get(i);
                 SqlCacheContext.ColumnSection cacheColumn = cacheFullSchema.get(i);
+                LOG.info("[sjw] TablesOrDataChanged, queryId: {}, currentColumn {} equals cacheColumn {}: {}",
+                    DebugUtil.printId(sqlCacheContext.getQueryId()),
+                    currentColumn.getName(), cacheColumn.getName(),
+                    (currentColumn.hashCode() == cacheColumn.getHashCode())
+                        && Objects.equals(currentColumn.getName(), cacheColumn.getName())
+                        && Objects.equals(currentColumn.getType().toString(), cacheColumn.getType()));
                 if (currentColumn == null) {
                     return true;
                 }
