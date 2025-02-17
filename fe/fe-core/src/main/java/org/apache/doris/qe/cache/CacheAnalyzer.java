@@ -704,6 +704,8 @@ public class CacheAnalyzer {
         Collection<Long> partitionIds = node.getSelectedPartitionIds();
         olapTable.getVersionInBatchForCloudMode(partitionIds);
 
+        LOG.info("[sjw] BuildCacheTableForOlapScanNode, queryId: {}, build cache.",
+            DebugUtil.printId(queryId));
         for (Long partitionId : node.getSelectedPartitionIds()) {
             Partition partition = olapTable.getPartition(partitionId);
             scanTable.addScanPartition(partitionId, partition.getVisibleVersion(true));
